@@ -210,7 +210,7 @@ class BaseEnv(gym.Env):
         enhanced_determinism: bool = False,
     ):
         self._enhanced_determinism = enhanced_determinism
-
+        print(robot_uids)
         self.num_envs = num_envs
         self.reconfiguration_freq = reconfiguration_freq if reconfiguration_freq is not None else 0
         self._reconfig_counter = 0
@@ -230,6 +230,7 @@ class BaseEnv(gym.Env):
             if self.robot_uids not in self.SUPPORTED_ROBOTS:
                 logger.warn(f"{self.robot_uids} is not in the task's list of supported robots. Code may not run as intended")
 
+        print(self.robot_uids)
         if sim_backend == "auto":
             if num_envs > 1:
                 sim_backend = "physx_cuda"
@@ -403,6 +404,7 @@ class BaseEnv(gym.Env):
                 articulations built separately in each environment.
         """
         agents = []
+        print(self.robot_uids)
         robot_uids = self.robot_uids
         if not isinstance(initial_agent_poses, list):
             initial_agent_poses = [initial_agent_poses]

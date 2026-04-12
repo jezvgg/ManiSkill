@@ -176,6 +176,7 @@ class Agent(nn.Module):
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(obs)
 
 class Logger:
+    # Логгирование я бы лучше через общий интерфейс сделал
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
@@ -186,6 +187,7 @@ class Logger:
     def close(self):
         self.writer.close()
 
+# Не хватает аннотаций
 def gae(next_obs, next_done, container, final_values):
     # bootstrap value if not done
     next_value = get_value(next_obs).reshape(-1)
@@ -219,6 +221,7 @@ def rollout(obs, done):
     final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
     for step in range(args.num_steps):
         # ALGO LOGIC: action logic
+        # Ну это совсем ахуй, использовать не объявленный policy
         action, logprob, _, value = policy(obs=obs)
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -400,7 +403,7 @@ if __name__ == "__main__":
         agent.parameters(),
         lr=torch.tensor(args.learning_rate, device=device),
         eps=1e-5,
-        capturable=args.cudagraphs and not args.compile,
+        capturable=args.cudagraphs and not args.compile, # Что такое cudagraphs тут?
     )
 
     ####### Executables #######
