@@ -64,8 +64,6 @@ class MyRoboCasaScene(BaseEnv):
             }
             for config in self.scene_builder.scene_data[0].get("fixture_cfgs")
         }
-        for name, cfg in self.fixture_placements.items():
-            print(f"{name}:pq({cfg['pos']}, {cfg['quat']}), size({cfg['size']})")
 
         bowl_path = os.path.join(
             ASSET_DIR,

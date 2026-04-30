@@ -45,22 +45,18 @@ if __name__ == "__main__":
     if mesh is not None:
         obb: Box = mesh.bounding_box_oriented
 
-    print("Calculate rotating position")
-    cup_pos = obb.center_mass
-    robot_pos = agent.base_link.pose.p[0].cpu().numpy()
-    direction = cup_pos - robot_pos
-    direction[2] = 0
+    bowl_mesh = unwenv.bowl.get_first_collision_mesh(to_world_frame=True)
+    if bowl_mesh is not None:
+        bowl_obb: Box = bowl_mesh.bounding_box_oriented
 
-    print("Rotating base to a cup")
-    planner.rotate_base_z(direction)
     planner.planner.update_from_simulation()
 
+    print("Calculate grasp position")
     tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
     ee_direction = obb.center_mass - tcp_pos
     ee_direction = ee_direction / np.linalg.norm(ee_direction)
     target_closing = agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
 
-    print("Calculate grasp position")
     grasp_info = compute_box_grasp_thin_side_info(
         obb,
         ee_direction=ee_direction,
@@ -76,37 +72,56 @@ if __name__ == "__main__":
     grasp_pose = agent.build_grasp_pose(approaching, closing, center)
 
     print("Reaching cup")
-    base_mask = [True, True, True] + [False] * 12
-    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.2])
+    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
     planner.static_manipulation(reach_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("Grasp cup")
-    grasp_cup = grasp_pose * sapien.Pose([0, 0, 0])
+    grasp_cup = grasp_pose
     planner.static_manipulation(grasp_cup, disable_lift_joint=False)
     planner.close_gripper()
     planner.planner.update_from_simulation()
 
     print("Lift cup")
-    lift_pose = grasp_pose * sapien.Pose([-0.2, 0, 0])
+    # Lift the cup up by 0.15m in world coordinates
+    lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
     planner.static_manipulation(lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
-    current_arm_pos = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-    current_body_pos = agent.controller.controllers["body"].qpos[0].cpu().numpy()
-    static_action = np.hstack(
-        [
-            current_arm_pos,
-            np.array([planner.gripper_state]),
-            current_body_pos,
-            np.zeros(2),
-        ]
-    ).astype(np.float32)
+    print("Go to bowl")
+    # Move over the bowl maintaining height
+    bowl_over_pos = bowl_obb.center_mass.copy()
+    bowl_over_pos[2] = lift_pose.p[2]
+    bowl_over_pose = sapien.Pose(bowl_over_pos, grasp_pose.q)
+    planner.static_manipulation(bowl_over_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
+
+    print("Lower cup")
+    # Lower into the bowl
+    bowl_lower_pos = bowl_obb.center_mass.copy()
+    bowl_lower_pos[2] += 0.08
+    bowl_lower_pose = sapien.Pose(bowl_lower_pos, grasp_pose.q)
+    planner.static_manipulation(bowl_lower_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
+
+    print("Release cup")
+    planner.open_gripper()
+    planner.planner.update_from_simulation()
+
+    print("Retract arm")
+    # Retract by 0.2m along the local Z axis (approach direction)
+    retract_pose = bowl_lower_pose * sapien.Pose([0, 0, -0.2])
+    planner.static_manipulation(retract_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
+
+    print("Task completed. Freezing robot...")
+    # Keep robot in place by sending zero delta/velocity
+    static_action = np.zeros(env.action_space.shape[-1], dtype=np.float32)
+    static_action[:7] = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+    static_action[7] = planner.gripper_state
+
     static_action_tensor = torch.as_tensor(static_action)
 
     while True:
-        obs, rew, terminated, truncated, info = env.step(static_action_tensor)
-        done = (terminated | truncated).any()
-
-    env.reset()
-    env.close()
+        env.step(static_action_tensor)
+        # Loop indefinitely to prevent script exit and reset
