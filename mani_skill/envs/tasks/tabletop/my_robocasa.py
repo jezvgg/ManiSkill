@@ -92,17 +92,28 @@ class MyRoboCasaScene(BaseEnv):
 
         self.bowl_pos = self.counter_pos.copy()
         self.bowl_pos[2] += self.counter_size[2] / 2 + get_actor_size(self.bowl)[2] / 2
+        self.bowl_pos[1] += self.counter_size[1] / 3
         self.bowl.set_pose(Pose.create_from_pq(p=self.bowl_pos))
 
         builder = loader.parse(str(cup_path), package_dir=os.path.dirname(cup_path))[
             "actor_builders"
         ][0]
-        self.cup = builder.build(name="cup")
+        cup_initial_pos = self.counter_pos.copy()
+        cup_initial_pos[0] += self.counter_size[0] / 6
+        cup_initial_pos[1] += self.counter_size[1] / 3
+        cup_initial_pos[2] += self.counter_size[2] / 2 + 0.3
+        builder.initial_pose = sapien.Pose(p=cup_initial_pos)
+        self.cup = builder.build_dynamic(name="cup")
 
         self.cup_pos = self.counter_pos.copy()
-        self.cup_pos[2] += self.counter_size[2] / 2 + get_actor_size(self.cup)[2] / 2
+        self.cup_pos[2] += (
+            self.counter_size[2] / 2 + get_actor_size(self.cup)[2] / 2 + 0.02
+        )
         self.cup_pos[0] += self.counter_size[0] / 6
-        self.cup.set_pose(Pose.create_from_pq(p=self.cup_pos))
+        self.cup_pos[1] += self.counter_size[1] / 3
+        cup_pose = Pose.create_from_pq(p=self.cup_pos)
+        self.cup.initial_pose = cup_pose
+        self.cup.set_pose(cup_pose)
 
         self.camera_pos = self.bowl_pos.copy()
         self.camera_pos[0] += self.counter_size[0] / 2

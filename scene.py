@@ -82,16 +82,26 @@ if __name__ == "__main__":
     planner.planner.update_from_simulation()
 
     print("Grasp cup")
-    grasp_cup = grasp_pose * sapien.Pose([-0.03, 0, -0.02])
+    grasp_cup = grasp_pose * sapien.Pose([0, 0, 0])
     planner.static_manipulation(grasp_cup, disable_lift_joint=False)
     planner.close_gripper()
     planner.planner.update_from_simulation()
 
+    print("Lift cup")
+    lift_pose = grasp_pose * sapien.Pose([-0.2, 0, 0])
+    planner.static_manipulation(lift_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
+
     current_arm_pos = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-    current_gripper_pos = agent.controller.controllers["gripper"].qpos[0].cpu().numpy()
-    static_action = np.zeros(13)
-    static_action[0:7] = current_arm_pos
-    static_action[7] = current_gripper_pos[0]
+    current_body_pos = agent.controller.controllers["body"].qpos[0].cpu().numpy()
+    static_action = np.hstack(
+        [
+            current_arm_pos,
+            np.array([planner.gripper_state]),
+            current_body_pos,
+            np.zeros(2),
+        ]
+    ).astype(np.float32)
     static_action_tensor = torch.as_tensor(static_action)
 
     while True:
