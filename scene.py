@@ -20,7 +20,7 @@ if __name__ == "__main__":
     env = gym.make(
         "MyRoboCasa-v1",
         num_envs=1,
-        render_mode="human",
+        render_mode="rgb_array",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
     )
@@ -29,7 +29,7 @@ if __name__ == "__main__":
         output_dir=os.path.join("videos", "my_robocasa"),
         save_video=True,
         video_fps=30,
-        save_on_reset=False,
+        save_on_reset=True,
     )
 
     unwenv: MyRoboCasaScene = env.unwrapped
@@ -83,13 +83,11 @@ if __name__ == "__main__":
     planner.planner.update_from_simulation()
 
     print("Lift cup")
-    # Lift the cup up by 0.15m in world coordinates
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
     planner.static_manipulation(lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("Go to bowl")
-    # Move over the bowl maintaining height
     bowl_over_pos = bowl_obb.center_mass.copy()
     bowl_over_pos[2] = lift_pose.p[2]
     bowl_over_pose = sapien.Pose(bowl_over_pos, grasp_pose.q)
@@ -97,7 +95,6 @@ if __name__ == "__main__":
     planner.planner.update_from_simulation()
 
     print("Lower cup")
-    # Lower into the bowl
     bowl_lower_pos = bowl_obb.center_mass.copy()
     bowl_lower_pos[2] += 0.08
     bowl_lower_pose = sapien.Pose(bowl_lower_pos, grasp_pose.q)
@@ -109,19 +106,10 @@ if __name__ == "__main__":
     planner.planner.update_from_simulation()
 
     print("Retract arm")
-    # Retract by 0.2m along the local Z axis (approach direction)
     retract_pose = bowl_lower_pose * sapien.Pose([0, 0, -0.2])
     planner.static_manipulation(retract_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
-    print("Task completed. Freezing robot...")
-    # Keep robot in place by sending zero delta/velocity
-    static_action = np.zeros(env.action_space.shape[-1], dtype=np.float32)
-    static_action[:7] = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-    static_action[7] = planner.gripper_state
-
-    static_action_tensor = torch.as_tensor(static_action)
-
-    while True:
-        env.step(static_action_tensor)
-        # Loop indefinitely to prevent script exit and reset
+    print("Task completed. Closing env...")
+    env.reset()
+    env.close()
