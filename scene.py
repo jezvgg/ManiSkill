@@ -1,4 +1,5 @@
 import os
+import random
 
 import gymnasium as gym
 import numpy as np
@@ -17,6 +18,13 @@ from mani_skill.examples.motionplanning.fetch.utils import (
 from mani_skill.utils.wrappers.record import RecordEpisode
 
 if __name__ == "__main__":
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
     env = gym.make(
         "MyRoboCasa-v1",
         num_envs=1,
@@ -36,18 +44,21 @@ if __name__ == "__main__":
     agent: Fetch = unwenv.agent
     FINGER_LENGTH = 0.025
 
-    obs, _ = env.reset(options={"reconfigure": True})
+    env.action_space.seed(SEED)
+    obs, _ = env.reset(seed=SEED, options={"reconfigure": True})
     planner = FetchMotionPlanningSapienSolver(
-        env, base_pose=agent.robot.pose, vis=True, print_env_info=True
+        env, base_pose=agent.robot.pose, vis=True, print_env_info=True, debug=True
     )
 
     mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
     if mesh is not None:
         obb: Box = mesh.bounding_box_oriented
+        cup_center = obb.center_mass.copy()
 
     bowl_mesh = unwenv.bowl.get_first_collision_mesh(to_world_frame=True)
     if bowl_mesh is not None:
         bowl_obb: Box = bowl_mesh.bounding_box_oriented
+        bowl_center = bowl_obb.center_mass.copy()
 
     planner.planner.update_from_simulation()
 
@@ -86,6 +97,54 @@ if __name__ == "__main__":
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
     planner.static_manipulation(lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
+
+    print("Drive base toward bowl")
+    base_tf = agent.base_link.pose.sp.to_transformation_matrix()
+    world_to_base_rot = base_tf[:3, :3].T
+    cup_center_local = world_to_base_rot @ (cup_center - base_tf[:3, 3])
+    bowl_center_local = world_to_base_rot @ (bowl_center - base_tf[:3, 3])
+    base_local_delta = bowl_center_local - cup_center_local
+    base_local_delta[2] = 0.0
+    base_transfer_delta = base_tf[:3, :3] @ base_local_delta
+    print("base transfer world:", np.round(base_transfer_delta, 4))
+    print("base transfer local:", np.round(base_local_delta, 4))
+    print("base +X world:", np.round(base_tf[:3, 0], 4))
+    print("base +Y world:", np.round(base_tf[:3, 1], 4))
+    if np.linalg.norm(base_transfer_delta) > 1e-3:
+        base_pos_for_drive = planner.base_env.agent.base_link.pose.sp.p.copy()
+        base_x_axis = base_tf[:3, 0]
+        base_x_axis = base_x_axis / np.linalg.norm(base_x_axis)
+        transfer_direction = base_transfer_delta / np.linalg.norm(base_transfer_delta)
+        base_turn_angle = np.arccos(
+            np.clip(np.dot(base_x_axis, transfer_direction), -1.0, 1.0)
+        )
+        if np.cross(base_x_axis, transfer_direction)[2] < 0:
+            base_turn_angle = -base_turn_angle
+
+        if abs(base_turn_angle) < np.deg2rad(2.0):
+            base_forward_delta = base_x_axis * base_local_delta[0]
+            base_target_pos = base_pos_for_drive + base_forward_delta
+            print(
+                "scene base move mode: forward",
+                "angle deg:",
+                np.round(np.rad2deg(base_turn_angle), 4),
+            )
+            print("scene base_pos_for_drive:", np.round(base_pos_for_drive, 4))
+            print("scene base_target_pos:", np.round(base_target_pos, 4))
+            planner.move_base_forward(base_target_pos, n_init_qpos=100)
+        else:
+            base_target_pos = base_pos_for_drive + base_transfer_delta
+            print(
+                "scene base move mode: drive_base",
+                "angle deg:",
+                np.round(np.rad2deg(base_turn_angle), 4),
+            )
+            print("scene base_pos_for_drive:", np.round(base_pos_for_drive, 4))
+            print("scene base_target_pos:", np.round(base_target_pos, 4))
+            planner.drive_base(target_pos=base_target_pos)
+        planner.planner.update_from_simulation()
+
+    planner.render_wait()
 
     print("Go to bowl")
     bowl_over_pos = bowl_obb.center_mass.copy()

@@ -122,7 +122,7 @@ class MyRoboCasaScene(BaseEnv):
         agent_pos = self.agent.robot.pose.p[0]
         agent_pos[0] = self.cup_pos[0]
         agent_pos[1] = self.cup_pos[1]
-        agent_pos[1] += self.counter_size[1] * 1.4
+        agent_pos[1] += self.counter_size[1] * 1.6
 
         q = degree_to_quanterion(z=180)
 
