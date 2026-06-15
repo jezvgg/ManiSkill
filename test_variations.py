@@ -1,4 +1,7 @@
 import os
+if "VK_ICD_FILENAMES" not in os.environ and os.path.exists("/home/jezv/vulkan_user/lvp_icd_user.json"):
+    os.environ["VK_ICD_FILENAMES"] = "/home/jezv/vulkan_user/lvp_icd_user.json"
+
 import gymnasium as gym
 import numpy as np
 import torch
