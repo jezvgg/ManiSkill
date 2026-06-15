@@ -18,7 +18,7 @@ from mani_skill.examples.motionplanning.fetch.utils import (
 from mani_skill.utils.wrappers.record import RecordEpisode
 
 if __name__ == "__main__":
-    SEED = 42
+    SEED = 3
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
