@@ -31,6 +31,7 @@ if __name__ == "__main__":
         render_mode="rgb_array",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
+        render_backend="pci:0000:00:00.0",
     )
     env = RecordEpisode(
         env,
@@ -47,7 +48,7 @@ if __name__ == "__main__":
     env.action_space.seed(SEED)
     obs, _ = env.reset(seed=SEED, options={"reconfigure": True})
     planner = FetchMotionPlanningSapienSolver(
-        env, base_pose=agent.robot.pose, vis=True, print_env_info=True, debug=True
+        env, base_pose=agent.robot.pose, vis=False, print_env_info=True, debug=True
     )
 
     mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)

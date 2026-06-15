@@ -45,7 +45,10 @@ render_backend_name_mapping = {
 
 def parse_backend_device_id(backend: str) -> tuple[str, int]:
     if ":" in backend:
-        return backend.split(":")
+        parts = backend.split(":")
+        if parts[0] == "pci":
+            return backend, None
+        return parts[0], int(parts[1])
     return backend, None
 
 
