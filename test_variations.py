@@ -11,8 +11,11 @@ import mani_skill.envs.tasks.tabletop.my_robocasa
 os.makedirs("videos/my_robocasa", exist_ok=True)
 
 print("Starting variations test verification...")
+layouts = [0, 2, 4, 5, 6]  # Different layout classes
 for i in range(5):
-    print(f"\n--- VARIATION {i} ---")
+    layout_idx = layouts[i]
+    config_idx = layout_idx * 12
+    print(f"\n--- VARIATION {i} (Layout: {layout_idx}, Config: {config_idx}) ---")
     env = gym.make(
         "MyRoboCasa-v1",
         num_envs=1,
@@ -20,7 +23,7 @@ for i in range(5):
         render_mode="rgb_array",
         render_backend="pci:0000:00:00.0"
     )
-    env.reset(seed=i)
+    env.reset(seed=i, options={"reconfigure": True, "build_config_idxs": [config_idx]})
     unw = env.unwrapped
     
     # Print locations

@@ -42,11 +42,17 @@ class MyRoboCasaScene(BaseEnv):
     def __init__(self, robot_uids="fetch", *args, **kwargs):
         super().__init__(robot_uids=robot_uids, *args, **kwargs)
 
+    def _load_agent(self, options: dict):
+        # Set a safe initial pose far from the center to prevent default init collision
+        safe_pose = sapien.Pose(p=[0.0, -3.0, 0.0])
+        super()._load_agent(options, initial_agent_poses=[safe_pose])
+
     def _load_scene(self, options: dict):
         super()._load_scene(options)
-        # Initialize scene builder centered on the main counter
+        # Initialize scene builder centered on the main counter and check for build_config_idxs override
+        build_config_idxs = options.get("build_config_idxs", None) if options else None
         self.scene_builder = RoboCasaSceneBuilder(self, init_robot_base_pos="counter_main")
-        self.scene_builder.build()
+        self.scene_builder.build(build_config_idxs=build_config_idxs)
 
         fixtures = self.scene_builder.scene_data[0]["fixtures"]
         self.main_counter = self.scene_builder.get_fixture(fixtures, "counter_main")
@@ -69,8 +75,11 @@ class MyRoboCasaScene(BaseEnv):
         loader = self.scene.create_mjcf_loader()
         loader.visual_groups = [1]
 
-        # Parse and build bowl
+        # Parse and build bowl (set approximate initial pose to avoid warning)
         builder = loader.parse(str(bowl_path), package_dir=os.path.dirname(bowl_path))["actor_builders"][0]
+        # We calculate an approximate height for the bowl's initial pose to prevent default [0,0,0] collision
+        approx_bowl_pos = (counter_pose * sapien.Pose(p=[0.0, self.counter_size[1] / 6, self.counter_size[2] / 2 + 0.1])).p
+        builder.initial_pose = sapien.Pose(p=approx_bowl_pos, q=self.main_counter.quat)
         self.bowl = builder.build(name="bowl")
 
         # Place bowl near the center of the main counter top (slightly towards back)
@@ -116,11 +125,25 @@ class MyRoboCasaScene(BaseEnv):
 
     def evaluate(self):
         bowl_radius = get_actor_size(self.bowl)[0] / 2
-        xy_distance = (
-            torch.linalg.norm(self.bowl.pose.p - self.cup.pose.p, dim=1) <= bowl_radius
-        )
-        z_distance = self.bowl.pose.p[0][2] >= self.cup.pose.p[0][2]
-        return dict(success=xy_distance & z_distance)
+        
+        # Calculate horizontal (XY) distance between the geometric center of the bowl and cup
+        diff_xy = self.cup.pose.p[:, :2] - self.bowl.pose.p[:, :2]
+        dist_xy = torch.linalg.norm(diff_xy, dim=1)
+        
+        # Calculate vertical (Z) distance: cup should be sitting inside the bowl
+        # i.e., cup bottom Z should be at or slightly below/above the bowl top Z.
+        # Let's check that cup bottom is inside the bowl vertically:
+        # cup Z height is at least near the bowl Z height, and cup bottom is not way above/below
+        # Let's say: cup center Z must be slightly above the bowl center Z, but horizontal position means it is in the cavity.
+        dist_z = self.cup.pose.p[:, 2] - self.bowl.pose.p[:, 2]
+        
+        # We assume success if the cup center is within the bowl's horizontal radius 
+        # and vertically it is placed inside (its Z position is within a reasonable range of the bowl's Z)
+        is_xy_close = dist_xy <= bowl_radius
+        is_z_inside = (dist_z > 0.0) & (dist_z < 0.15)
+        
+        success = is_xy_close & is_z_inside
+        return dict(success=success)
 
     def compute_dense_reward(self, obs: object = None, action: torch.Tensor = None, info: dict = None):
         bowl_size = get_actor_size(self.bowl)

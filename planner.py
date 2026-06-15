@@ -39,7 +39,7 @@ if __name__ == "__main__":
     env = RecordEpisode(
         env,
         output_dir=os.path.join("videos", "my_robocasa"),
-        save_video=True,
+        save_video=False,
         video_fps=30,
         save_on_reset=True,
     )
@@ -172,6 +172,17 @@ if __name__ == "__main__":
     retract_pose = bowl_lower_pose * sapien.Pose([0, 0, -0.2])
     planner.static_manipulation(retract_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
+
+    # Evaluate the success using the environmental checker
+    eval_dict = unwenv.evaluate()
+    print("\n================ SUCCESS CHECKER ================")
+    print("Success evaluation outcome:", eval_dict)
+    success = bool(eval_dict.get("success", False))
+    if success:
+        print("RESULT: SUCCESS! The cup was successfully placed in the bowl.")
+    else:
+        print("RESULT: FAILURE! The cup was NOT placed inside the bowl successfully.")
+    print("=================================================\n")
 
     print("Task completed. Closing env...")
     env.reset()
