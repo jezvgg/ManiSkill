@@ -14,7 +14,7 @@ from mani_skill.agents.base_agent import BaseAgent
 @register_agent()
 class DSFetch(Fetch):
     uid = "ds_fetch"
-    urdf_path = f"/home/jezv/Projects/ManiSkill/mani_skill/examples/motionplanning/fetch/fetch.urdf"
+    urdf_path = f"/home/jezv/ManiSkill/mani_skill/examples/motionplanning/fetch/fetch.urdf"
 
     @property
     def _sensor_configs(self):
