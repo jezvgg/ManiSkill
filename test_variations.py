@@ -10,12 +10,11 @@ import mani_skill.envs.tasks.tabletop.my_robocasa
 
 os.makedirs("videos/my_robocasa", exist_ok=True)
 
-print("Starting variations test verification...")
-layouts = [0, 2, 4, 5, 6]  # Different layout classes
-for i in range(5):
-    layout_idx = layouts[i]
-    config_idx = layout_idx * 12
-    print(f"\n--- VARIATION {i} (Layout: {layout_idx}, Config: {config_idx}) ---")
+print("Starting variations test verification (10 configs)...")
+# 10 configurations across different layouts / designs
+configs = [0, 12, 24, 36, 48, 60, 72, 84, 96, 108]
+for i, config_idx in enumerate(configs):
+    print(f"\n--- VARIATION {i} (Config Override: {config_idx}) ---")
     env = gym.make(
         "MyRoboCasa-v1",
         num_envs=1,
@@ -32,11 +31,6 @@ for i in range(5):
     print(f"Bowl Pos: {unw.bowl.pose.p[0].cpu().numpy()}")
     print(f"Cup Pos: {unw.cup.pose.p[0].cpu().numpy()}")
     print(f"Robot Base Pos: {unw.agent.robot.pose.p[0].cpu().numpy()}")
-    print(f"Robot Base Quat: {unw.agent.robot.pose.q[0].cpu().numpy()}")
-    
-    # Verify positions on main counter
-    # Y-axis bounds of main counter: main_counter.pos[1] - size[1]/2 to main_counter.pos[1] + size[1]/2
-    # Since robot is 1.6m away, etc.
     
     # Render and save frame
     img = env.render()

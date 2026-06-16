@@ -243,15 +243,19 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
         actors: list[Entity] = sim_scene.get_all_actors()
 
         for articulation in articulations:
-            if not self.disable_actors_collision or articulation in planned_articulations:
+            if True:
                 urdf_str = export_kinematic_chain_urdf(articulation)
                 srdf_str = export_srdf(articulation)
+
+                # When disable_actors_collision is True, load articulation links with tiny spheres
+                # to ignore counter/cabinet collisions in motion planning queries.
+                disable_coll = self.disable_actors_collision
 
                 # Convert all links to FCLObject
                 collision_links = [
                     fcl_obj
                     for link in articulation.links
-                    if (fcl_obj := self.convert_physx_component(link)) is not None
+                    if (fcl_obj := self.convert_physx_component(link, disable_collision=disable_coll)) is not None
                 ]
 
                 articulated_model = mplib.ArticulatedModel.create_from_urdf_string(
@@ -275,8 +279,6 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
         
         # if not self.disable_actors_collision:
         for entity in actors:
-            if self.disable_actors_collision and 'food' in entity.name:
-                continue
             component = entity.find_component_by_type(sapien.physx.PhysxRigidBaseComponent)
             assert component is not None, (
                 f"No PhysxRigidBaseComponent found in {entity.name}: "
@@ -284,11 +286,11 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
             )
 
             # Convert collision shapes at current global pose
-            if (fcl_obj := self.convert_physx_component(component)) is not None:  # type: ignore
+            if (fcl_obj := self.convert_physx_component(component, disable_collision=self.disable_actors_collision)) is not None:  # type: ignore
                 self.add_object(fcl_obj)
 
     @staticmethod
-    def convert_physx_component(comp: physx.PhysxRigidBaseComponent) -> FCLObject | None:
+    def convert_physx_component(comp: physx.PhysxRigidBaseComponent, disable_collision=False) -> FCLObject | None:
         """
         Converts a SAPIEN physx.PhysxRigidBaseComponent to an FCLObject.
         All shapes in the returned FCLObject are already set at their world poses.
@@ -299,50 +301,56 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
         """
         shapes: list[CollisionObject] = []
         shape_poses: list[mplib.Pose] = []
-        for shape in comp.collision_shapes:
-            shape_poses.append(mplib.Pose(shape.local_pose))  # type: ignore
-
-            if isinstance(shape, physx.PhysxCollisionShapeBox):
-                c_geom = fcl.Box(side=shape.half_size * 2)
-            elif isinstance(shape, physx.PhysxCollisionShapeCapsule):
-                c_geom = fcl.Capsule(radius=shape.radius, lz=shape.half_length * 2)
-                # NOTE: physx Capsule has x-axis along capsule height
-                # FCL Capsule has z-axis along capsule height
-                shape_poses[-1] *= mplib.Pose(q=euler2quat(0, np.pi / 2, 0))
-            elif isinstance(shape, PhysxCollisionShapeConvexMesh):
-                # assert np.allclose(
-                #     shape.scale, 1.0
-                # ), f"Not unit scale {shape.scale}, need to rescale vertices?"
-
-                # Scale vertices!
-                vertices = shape.vertices
-                vertices[:, 0] *= shape.scale[0]
-                vertices[:, 1] *= shape.scale[1]
-                vertices[:, 2] *= shape.scale[2]
-                c_geom = Convex(vertices=vertices, faces=shape.triangles)
-            elif isinstance(shape, physx.PhysxCollisionShapeCylinder):
-                c_geom = fcl.Cylinder(radius=shape.radius, lz=shape.half_length * 2)
-                # NOTE: physx Cylinder has x-axis along cylinder height
-                # FCL Cylinder has z-axis along cylinder height
-                shape_poses[-1] *= mplib.Pose(q=euler2quat(0, np.pi / 2, 0))
-            elif isinstance(shape, physx.PhysxCollisionShapePlane):
-                # PhysxCollisionShapePlane are actually a halfspace
-                # https://nvidia-omniverse.github.io/PhysX/physx/5.3.1/docs/Geometry.html#planes
-                # PxPlane's Pose determines its normal and offert (normal is +x)
-                n = shape_poses[-1].to_transformation_matrix()[:3, 0]
-                d = n.dot(shape_poses[-1].p)
-                c_geom = fcl.Halfspace(n=n, d=d)
-                shape_poses[-1] = mplib.Pose()
-            elif isinstance(shape, physx.PhysxCollisionShapeSphere):
-                c_geom = fcl.Sphere(radius=shape.radius)
-            elif isinstance(shape, physx.PhysxCollisionShapeTriangleMesh):
-                c_geom = fcl.BVHModel()
-                c_geom.begin_model()
-                c_geom.add_sub_model(vertices=shape.vertices, faces=shape.triangles)  # type: ignore
-                c_geom.end_model()
-            else:
-                raise TypeError(f"Unknown shape type: {type(shape)}")
+        
+        if disable_collision:
+            c_geom = fcl.Sphere(radius=1e-6)
             shapes.append(CollisionObject(c_geom))
+            shape_poses.append(mplib.Pose())
+        else:
+            for shape in comp.collision_shapes:
+                shape_poses.append(mplib.Pose(shape.local_pose))  # type: ignore
+
+                if isinstance(shape, physx.PhysxCollisionShapeBox):
+                    c_geom = fcl.Box(side=shape.half_size * 2)
+                elif isinstance(shape, physx.PhysxCollisionShapeCapsule):
+                    c_geom = fcl.Capsule(radius=shape.radius, lz=shape.half_length * 2)
+                    # NOTE: physx Capsule has x-axis along capsule height
+                    # FCL Capsule has z-axis along capsule height
+                    shape_poses[-1] *= mplib.Pose(q=euler2quat(0, np.pi / 2, 0))
+                elif isinstance(shape, PhysxCollisionShapeConvexMesh):
+                    # assert np.allclose(
+                    #     shape.scale, 1.0
+                    # ), f"Not unit scale {shape.scale}, need to rescale vertices?"
+
+                    # Scale vertices!
+                    vertices = shape.vertices
+                    vertices[:, 0] *= shape.scale[0]
+                    vertices[:, 1] *= shape.scale[1]
+                    vertices[:, 2] *= shape.scale[2]
+                    c_geom = Convex(vertices=vertices, faces=shape.triangles)
+                elif isinstance(shape, physx.PhysxCollisionShapeCylinder):
+                    c_geom = fcl.Cylinder(radius=shape.radius, lz=shape.half_length * 2)
+                    # NOTE: physx Cylinder has x-axis along cylinder height
+                    # FCL Cylinder has z-axis along cylinder height
+                    shape_poses[-1] *= mplib.Pose(q=euler2quat(0, np.pi / 2, 0))
+                elif isinstance(shape, physx.PhysxCollisionShapePlane):
+                    # PhysxCollisionShapePlane are actually a halfspace
+                    # https://nvidia-omniverse.github.io/PhysX/physx/5.3.1/docs/Geometry.html#planes
+                    # PxPlane's Pose determines its normal and offert (normal is +x)
+                    n = shape_poses[-1].to_transformation_matrix()[:3, 0]
+                    d = n.dot(shape_poses[-1].p)
+                    c_geom = fcl.Halfspace(n=n, d=d)
+                    shape_poses[-1] = mplib.Pose()
+                elif isinstance(shape, physx.PhysxCollisionShapeSphere):
+                    c_geom = fcl.Sphere(radius=shape.radius)
+                elif isinstance(shape, physx.PhysxCollisionShapeTriangleMesh):
+                    c_geom = fcl.BVHModel()
+                    c_geom.begin_model()
+                    c_geom.add_sub_model(vertices=shape.vertices, faces=shape.triangles)  # type: ignore
+                    c_geom.end_model()
+                else:
+                    raise TypeError(f"Unknown shape type: {type(shape)}")
+                shapes.append(CollisionObject(c_geom))
             
         if len(shapes) == 0:
             return None

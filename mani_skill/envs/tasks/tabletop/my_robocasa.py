@@ -110,11 +110,14 @@ class MyRoboCasaScene(BaseEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         super()._initialize_episode(env_idx, options)
+        # Set initial tuck qpos to prevent start collisions for ds_fetch or fetch
+        if "rest" in self.agent.keyframes:
+            self.agent.robot.set_qpos(self.agent.keyframes["rest"].qpos)
         # Manually orient and position the robot base relative to the main counter and cup
         counter_pose = sapien.Pose(p=self.counter_pos, q=self.main_counter.quat)
         robot_local_pos = [
-            self.counter_size[0] / 6,
-            -self.counter_size[1] * 1.6,  # 1.6m back from cup locally (adjust for reach)
+            self.counter_size[0] / 12, # Center between bowl (0.0) and cup (counter_size[0]/6)
+            -self.counter_size[1] * 1.30,  # 1.30m back (0.845m from center) for perfect workspace reach and cabinet clearance
             0.0
         ]
         agent_pos = (counter_pose * sapien.Pose(p=robot_local_pos)).p
@@ -132,17 +135,15 @@ class MyRoboCasaScene(BaseEnv):
         
         # Calculate vertical (Z) distance: cup should be sitting inside the bowl
         # i.e., cup bottom Z should be at or slightly below/above the bowl top Z.
-        # Let's check that cup bottom is inside the bowl vertically:
-        # cup Z height is at least near the bowl Z height, and cup bottom is not way above/below
-        # Let's say: cup center Z must be slightly above the bowl center Z, but horizontal position means it is in the cavity.
         dist_z = self.cup.pose.p[:, 2] - self.bowl.pose.p[:, 2]
         
-        # We assume success if the cup center is within the bowl's horizontal radius 
-        # and vertically it is placed inside (its Z position is within a reasonable range of the bowl's Z)
+        # We check that the robot is not grasping the cup, the cup is horizontally close to the bowl center,
+        # and vertically it is placed inside the bowl.
         is_xy_close = dist_xy <= bowl_radius
-        is_z_inside = (dist_z > 0.0) & (dist_z < 0.15)
+        is_z_inside = (dist_z > -0.05) & (dist_z < 0.15)
+        is_not_grasped = ~self.agent.is_grasping(self.cup)
         
-        success = is_xy_close & is_z_inside
+        success = is_xy_close & is_z_inside & is_not_grasped
         return dict(success=success)
 
     def compute_dense_reward(self, obs: object = None, action: torch.Tensor = None, info: dict = None):
