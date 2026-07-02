@@ -146,27 +146,63 @@ if __name__ == "__main__":
 
     planner.render_wait()
 
-    print("Go to bowl")
-    bowl_over_pos = bowl_obb.center_mass.copy()
-    bowl_over_pos[2] = lift_pose.p[2]
-    bowl_over_pose = sapien.Pose(bowl_over_pos, grasp_pose.q)
-    planner.static_manipulation(bowl_over_pose, disable_lift_joint=False)
-    planner.planner.update_from_simulation()
+    # print("Go to bowl")
+    # bowl_over_pos = bowl_obb.center_mass.copy()
+    # bowl_over_pos[2] = lift_pose.p[2]
+    # bowl_over_pose = sapien.Pose(bowl_over_pos, grasp_pose.q)
+    # planner.static_manipulation(bowl_over_pose, disable_lift_joint=False)
+    # planner.planner.update_from_simulation()
 
-    print("Lower cup")
-    bowl_lower_pos = bowl_obb.center_mass.copy()
-    bowl_lower_pos[2] += 0.08
-    bowl_lower_pose = sapien.Pose(bowl_lower_pos, grasp_pose.q)
-    planner.static_manipulation(bowl_lower_pose, disable_lift_joint=False)
+    print("Lower cup (Smooth vertical movement)")
+    unw_env = env.unwrapped
+    arm_action = unw_env.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+
+    # Запоминаем НАЧАЛЬНОЕ состояние тела перед опусканием
+    start_body_action = (
+        unw_env.agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
+    )
+
+    base_action = np.array([0.0, 0.0])
+    gripper_action = planner.gripper_state
+
+    # Настройки скорости:
+    # 100 шагов сделают движение очень осторожным и плавным
+    total_steps = 100
+    target_drop = 0.17  # Всего нужно опустить на 7 см
+
+    for step in range(total_steps):
+        # Вычисляем промежуточную цель на текущем шаге
+        fraction = (step + 1) / total_steps
+        current_drop = fraction * target_drop
+
+        # Обновляем только высоту торса от начальной точки
+        body_action = start_body_action.copy()
+        body_action[2] -= current_drop
+
+        # Собираем экшен и шагаем
+        action = np.hstack([arm_action, gripper_action, body_action, base_action])
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        if hasattr(unw_env, "render_human"):
+            unw_env.render_human()
+
+    # Синхронизируем планер
     planner.planner.update_from_simulation()
 
     print("Release cup")
     planner.open_gripper()
     planner.planner.update_from_simulation()
 
-    print("Retract arm")
-    retract_pose = bowl_lower_pose * sapien.Pose([0, 0, -0.2])
-    planner.static_manipulation(retract_pose, disable_lift_joint=False)
+    print("Retract arm (Bypassing planner to lift torso back up)")
+    # Поднимаем торс обратно вверх на 15 см, чтобы гарантированно выйти из миски
+    body_action[2] += 0.15
+    action = np.hstack([arm_action, planner.gripper_state, body_action, base_action])
+
+    for _ in range(40):
+        env.step(action)
+        if hasattr(unw_env, "render_human"):
+            unw_env.render_human()
+
     planner.planner.update_from_simulation()
 
     print("Task completed. Closing env...")
