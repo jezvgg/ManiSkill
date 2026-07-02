@@ -103,11 +103,11 @@ if __name__ == "__main__":
     world_to_base_rot = base_tf[:3, :3].T
     cup_center_local = world_to_base_rot @ (cup_center - base_tf[:3, 3])
     bowl_center_local = world_to_base_rot @ (bowl_center - base_tf[:3, 3])
-    base_local_delta = bowl_center_local - cup_center_local
-    base_local_delta[2] = 0.0
-    base_transfer_delta = base_tf[:3, :3] @ base_local_delta
+    base_transfer_delta = bowl_center_local - cup_center_local
+    base_transfer_delta[2] = 0.0
+    # base_transfer_delta = base_tf[:3, :3] @ base_local_delta
     print("base transfer world:", np.round(base_transfer_delta, 4))
-    print("base transfer local:", np.round(base_local_delta, 4))
+    # print("base transfer local:", np.round(base_local_delta, 4))
     print("base +X world:", np.round(base_tf[:3, 0], 4))
     print("base +Y world:", np.round(base_tf[:3, 1], 4))
     if np.linalg.norm(base_transfer_delta) > 1e-3:
@@ -122,7 +122,7 @@ if __name__ == "__main__":
             base_turn_angle = -base_turn_angle
 
         if abs(base_turn_angle) < np.deg2rad(2.0):
-            base_forward_delta = base_x_axis * base_local_delta[0]
+            base_forward_delta = base_x_axis * base_transfer_delta[0]
             base_target_pos = base_pos_for_drive + base_forward_delta
             print(
                 "scene base move mode: forward",
@@ -170,5 +170,7 @@ if __name__ == "__main__":
     planner.planner.update_from_simulation()
 
     print("Task completed. Closing env...")
+    success = unwenv.evaluate()["success"]
+    print("Success:", success[0])
     env.reset()
     env.close()

@@ -1,6 +1,7 @@
 from .allegro_hand import *
 from .anymal import ANYmalC
 from .dclaw import DClaw
+from .ds_fetch import *
 from .fetch import Fetch
 from .floating_ability_hand import FloatingAbilityHandRight
 from .floating_panda_gripper import FloatingPandaGripper

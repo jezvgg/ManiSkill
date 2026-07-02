@@ -81,16 +81,17 @@ class MyRoboCasaScene(BaseEnv):
         ][0]
         self.bowl = builder.build(name="bowl")
 
-        self.counter_pos = self.fixture_placements["counter_1_front_group_Counter"][
+        self.counter_pos = self.fixture_placements["counter_main_main_group_Counter"][
             "pos"
         ]
-        self.counter_size = self.fixture_placements["counter_1_front_group_Counter"][
+        self.counter_size = self.fixture_placements["counter_main_main_group_Counter"][
             "size"
         ]
 
         self.bowl_pos = self.counter_pos.copy()
+        self.bowl_pos[0] += self.counter_size[0] / 3
+        self.bowl_pos[1] -= self.counter_size[1] / 4
         self.bowl_pos[2] += self.counter_size[2] / 2 + get_actor_size(self.bowl)[2] / 2
-        self.bowl_pos[1] += self.counter_size[1] / 3
         self.bowl.set_pose(Pose.create_from_pq(p=self.bowl_pos))
 
         builder = loader.parse(str(cup_path), package_dir=os.path.dirname(cup_path))[
@@ -98,8 +99,8 @@ class MyRoboCasaScene(BaseEnv):
         ][0]
         cup_initial_pos = self.counter_pos.copy()
         cup_initial_pos[0] += self.counter_size[0] / 6
-        cup_initial_pos[1] += self.counter_size[1] / 3
         cup_initial_pos[2] += self.counter_size[2] / 2 + 0.3
+        cup_initial_pos[1] -= self.counter_size[1] / 4
         builder.initial_pose = sapien.Pose(p=cup_initial_pos)
         self.cup = builder.build_dynamic(name="cup")
 
@@ -108,21 +109,22 @@ class MyRoboCasaScene(BaseEnv):
             self.counter_size[2] / 2 + get_actor_size(self.cup)[2] / 2 + 0.02
         )
         self.cup_pos[0] += self.counter_size[0] / 6
-        self.cup_pos[1] += self.counter_size[1] / 3
+        self.cup_pos[1] -= self.counter_size[1] / 4
         cup_pose = Pose.create_from_pq(p=self.cup_pos)
         self.cup.initial_pose = cup_pose
         self.cup.set_pose(cup_pose)
 
         self.camera_pos = self.bowl_pos.copy()
-        self.camera_pos[0] += self.counter_size[0] / 2
-        self.camera_pos[2] += self.counter_size[2]
+        self.camera_pos[0] -= self.counter_size[0] / 4
+        self.camera_pos[1] -= self.counter_size[1] / 2
+        self.camera_pos[2] += self.counter_size[2] / 2
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         super()._initialize_episode(env_idx, options)
         agent_pos = self.agent.robot.pose.p[0]
         agent_pos[0] = self.cup_pos[0]
         agent_pos[1] = self.cup_pos[1]
-        agent_pos[1] += self.counter_size[1] * 1.6
+        agent_pos[1] -= self.counter_size[1] * 1.6
 
         q = degree_to_quanterion(z=180)
 
