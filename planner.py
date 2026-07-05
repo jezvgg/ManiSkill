@@ -17,37 +17,18 @@ from mani_skill.examples.motionplanning.fetch.utils import (
 )
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-if __name__ == "__main__":
-    SEED = 3
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
 
-    env = gym.make(
-        "MyRoboCasa-v1",
-        num_envs=1,
-        render_mode="rgb_array",
-        robot_uids="ds_fetch",
-        control_mode="pd_joint_pos",
-    )
-    env = RecordEpisode(
-        env,
-        output_dir=os.path.join("videos", "my_robocasa"),
-        save_video=True,
-        video_fps=30,
-        save_on_reset=True,
-    )
-
+def planning(env, seed, debug=False) -> bool:
     unwenv: MyRoboCasaScene = env.unwrapped
     agent: Fetch = unwenv.agent
     FINGER_LENGTH = 0.025
-
-    env.action_space.seed(SEED)
-    obs, _ = env.reset(seed=SEED, options={"reconfigure": True})
+    obs, _ = env.reset(seed=seed, options={"reconfigure": True})
     planner = FetchMotionPlanningSapienSolver(
-        env, base_pose=agent.robot.pose, vis=True, print_env_info=True, debug=True
+        env,
+        base_pose=agent.robot.pose,
+        vis=True,
+        print_env_info=True,
+        debug=debug,
     )
 
     mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
@@ -146,13 +127,6 @@ if __name__ == "__main__":
 
     planner.render_wait()
 
-    # print("Go to bowl")
-    # bowl_over_pos = bowl_obb.center_mass.copy()
-    # bowl_over_pos[2] = lift_pose.p[2]
-    # bowl_over_pose = sapien.Pose(bowl_over_pos, grasp_pose.q)
-    # planner.static_manipulation(bowl_over_pose, disable_lift_joint=False)
-    # planner.planner.update_from_simulation()
-
     print("Lower cup (Smooth vertical movement)")
     unw_env = env.unwrapped
     arm_action = unw_env.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
@@ -209,4 +183,31 @@ if __name__ == "__main__":
     success = unwenv.evaluate()["success"]
     print("Success:", success[0])
     env.reset()
+    return success
+
+
+if __name__ == "__main__":
+    SEED = 3
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    env = gym.make(
+        "MyRoboCasa-v1",
+        num_envs=1,
+        render_mode="rgb_array",
+        robot_uids="ds_fetch",
+        control_mode="pd_joint_pos",
+    )
+    env = RecordEpisode(
+        env,
+        output_dir=os.path.join("videos", "my_robocasa"),
+        save_video=True,
+        video_fps=30,
+        save_on_reset=True,
+    )
+    env.action_space.seed(SEED)
+    planning(env)
     env.close()
