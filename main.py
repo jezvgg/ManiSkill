@@ -119,8 +119,19 @@ if __name__ == "__main__":
     print(f"[Готово] Видео успешно сохранено!")
     # --------------------------------------------------------------------------
 
-    print("\nОтображаем интерактивное окно...")
-    plt.tight_layout()
-    plt.show()
+    num_success = sum(success_statuses)
+    total_scenes = len(success_statuses)
+    success_rate = (num_success / total_scenes) * 100
+
+    print("\n=== СТАТИСТИКА ТЕСТИРОВАНИЯ ===")
+    print(f"Всего сцен: {total_scenes}")
+    print(f"Успешно: {num_success}")
+    print(f"Провалено: {total_scenes - num_success}")
+    print(f"Success rate: {success_rate:.2f}%")
+    print("===============================\n")
+
+    print("Отображаем интерактивное окно...")
+    # plt.tight_layout()
+    # plt.show()
 
     env.close()

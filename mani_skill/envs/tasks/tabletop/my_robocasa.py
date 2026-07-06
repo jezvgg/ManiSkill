@@ -137,11 +137,21 @@ class MyRoboCasaScene(BaseEnv):
         центральную позицию чашки. По идее это значит, что кружка в чашке.
         """
         bowl_radius = get_actor_size(self.bowl)[0] / 2
-        xy_distance = (
-            torch.linalg.norm(self.bowl.pose.p - self.cup.pose.p, dim=1) <= bowl_radius
-        )
-        z_distance = self.bowl.pose.p[0][2] >= self.cup.pose.p[0][2]
-        return dict(success=xy_distance & z_distance)
+        
+        bowl_pos = self.bowl.pose.p
+        cup_pos = self.cup.pose.p
+
+        xy_diff = torch.linalg.norm(bowl_pos[..., :2] - cup_pos[..., :2], dim=1)
+        z_diff = cup_pos[..., 2] - bowl_pos[..., 2]
+        
+        is_grasped = self.agent.is_grasping(self.cup)
+
+        xy_distance = xy_diff <= bowl_radius
+        z_distance = (z_diff >= 0.02) & (z_diff <= 0.08)
+        
+        success = xy_distance & z_distance & (~is_grasped)
+
+        return dict(success=success)
 
     def compute_dense_reward(self):
         """

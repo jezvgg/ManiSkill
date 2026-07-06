@@ -18,7 +18,9 @@ from mani_skill.examples.motionplanning.fetch.utils import (
 from mani_skill.utils.wrappers.record import RecordEpisode
 
 
-def planning(env, seed, debug=False) -> bool:
+def planning(env, seed, debug=False, vis=None) -> bool:
+    if vis is None:
+        vis = (env.unwrapped.render_mode == "human")
     unwenv: MyRoboCasaScene = env.unwrapped
     agent: Fetch = unwenv.agent
     FINGER_LENGTH = 0.025
@@ -26,7 +28,7 @@ def planning(env, seed, debug=False) -> bool:
     planner = FetchMotionPlanningSapienSolver(
         env,
         base_pose=agent.robot.pose,
-        vis=True,
+        vis=vis,
         print_env_info=True,
         debug=debug,
     )
@@ -157,7 +159,7 @@ def planning(env, seed, debug=False) -> bool:
         action = np.hstack([arm_action, gripper_action, body_action, base_action])
         obs, reward, terminated, truncated, info = env.step(action)
 
-        if hasattr(unw_env, "render_human"):
+        if vis and hasattr(unw_env, "render_human"):
             unw_env.render_human()
 
     # Синхронизируем планер
@@ -174,7 +176,7 @@ def planning(env, seed, debug=False) -> bool:
 
     for _ in range(40):
         env.step(action)
-        if hasattr(unw_env, "render_human"):
+        if vis and hasattr(unw_env, "render_human"):
             unw_env.render_human()
 
     planner.planner.update_from_simulation()
@@ -209,5 +211,5 @@ if __name__ == "__main__":
         save_on_reset=True,
     )
     env.action_space.seed(SEED)
-    planning(env)
+    planning(env, SEED)
     env.close()
