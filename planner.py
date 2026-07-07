@@ -65,10 +65,50 @@ def planning(env, seed, debug=False, vis=None) -> bool:
         grasp_info["approaching"],
     )
     grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+
+    base_pos = agent.base_link.pose.p[0].cpu().numpy()
+    target_to_cup = reach_pose.p - cup_center
+    base_to_cup = base_pos - cup_center
+    
+    # Validation: if the target is on the far side of the cup relative to the robot base
+    if np.dot(target_to_cup, base_to_cup) < 0:
+        print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction,
+            target_closing=target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
 
     print("Reaching cup")
-    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
-    planner.static_manipulation(reach_pose, disable_lift_joint=False)
+    res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
+    
+    if res == -1:
+        print("Reaching cup failed, trying opposite closing direction as fallback...")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction if np.dot(target_to_cup, base_to_cup) < 0 else ee_direction,
+            target_closing=-target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+        res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("Grasp cup")
