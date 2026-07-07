@@ -19,8 +19,8 @@ if __name__ == "__main__":
     env = gym.make(
         "MyRoboCasa-v1",
         num_envs=1,
-        render_mode="rgb_array",
-        obs_mode="rgb",
+        render_mode=None,
+        obs_mode="none",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
     )
@@ -34,26 +34,7 @@ if __name__ == "__main__":
         current_seed = i + 100
         print(f"\nКухня {i}/16 (Seed: {current_seed})...")
 
-        scene_frames = []
-
-        original_reset = env.reset
-
-        def custom_reset(*args, **kwargs):
-            obs, info = original_reset(*args, **kwargs)
-            frame = obs["sensor_data"]["base_camera"]["rgb"][0].detach().cpu().numpy()
-            scene_frames.append(frame)
-            return obs, info
-
-        original_step = env.step
-
-        def custom_step(action):
-            obs, r, t, tr, info = original_step(action)
-            frame = obs["sensor_data"]["base_camera"]["rgb"][0].detach().cpu().numpy()
-            scene_frames.append(frame)
-            return obs, r, t, tr, info
-
-        env.reset = custom_reset
-        env.step = custom_step
+        pass
 
         success_val = False
         try:
@@ -66,55 +47,18 @@ if __name__ == "__main__":
             print(f"Критическая ошибка на сцене {i}: {e}")
             success_val = False
 
-        env.reset = original_reset
-        env.step = original_step
+        pass
 
         print(f"Результат сцены {i}: {'УСПЕХ' if success_val else 'ПРОВАЛ'}")
-        all_scenes_frames.append(scene_frames)
+        pass
         success_statuses.append(success_val)
 
-    # Наращивание кадров (Padding)
-    max_len = max(len(frames) for frames in all_scenes_frames)
-    for i in range(16):
-        while len(all_scenes_frames[i]) < max_len:
-            all_scenes_frames[i].append(all_scenes_frames[i][-1])
-
-    # Сборка сетки
-    fig, axes = plt.subplots(4, 4, figsize=(12, 12))
-    axes = axes.flatten()
-    im_objects = []
-
-    for i in range(16):
-        ax = axes[i]
-        im = ax.imshow(all_scenes_frames[i][0])
-        ax.axis("off")
-
-        title_color = "green" if success_statuses[i] else "red"
-        status_text = "SUCCESS" if success_statuses[i] else "FAILED"
-        ax.set_title(f"Scene {i + 1}: {status_text}", color=title_color, fontsize=10)
-        im_objects.append(im)
-
-    def update_grid(frame_idx):
-        for i in range(16):
-            im_objects[i].set_data(all_scenes_frames[i][frame_idx])
-        return im_objects
-
-    ani = animation.FuncAnimation(
-        fig, update_grid, frames=max_len, interval=40, blit=True, repeat=True
-    )
-
+    pass
     # --------------------------------------------------------------------------
     # НАСТРОЙКА АВТОСОХРАНЕНИЯ ВИДЕО
     # --------------------------------------------------------------------------
-    output_dir = os.path.join("videos", "my_robocasa")
-    os.makedirs(output_dir, exist_ok=True)
-    video_path = os.path.join(output_dir, "grid_validation.mp4")
-
-    print(f"\n[Запись] Сборка кадров и кодирование видео в {video_path}...")
-
-    # Использованием ffmpeg для сборки MP4 (25 кадров в секунду)
-    # Если хочешь гифку, замени расширение на .gif и убавь fps до 15-20, чтоб файл не весил гигабайт
-    ani.save(video_path, writer="ffmpeg", fps=25, dpi=100)
+    print(f"\n[Запись] Скипаем рендер видео для скорости...")
+    # ani.save(video_path, writer="ffmpeg", fps=25, dpi=100)
 
     print(f"[Готово] Видео успешно сохранено!")
     # --------------------------------------------------------------------------

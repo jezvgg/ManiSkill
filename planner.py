@@ -45,6 +45,7 @@ def planning(env, seed, debug=False, vis=None) -> bool:
 
     planner.planner.update_from_simulation()
 
+
     print("Calculate grasp position")
     tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
     ee_direction = obb.center_mass - tcp_pos
@@ -88,9 +89,12 @@ def planning(env, seed, debug=False, vis=None) -> bool:
     bowl_center_local = world_to_base_rot @ (bowl_center - base_tf[:3, 3])
     base_transfer_delta = bowl_center_local - cup_center_local
     base_transfer_delta[2] = 0.0
-    # base_transfer_delta = base_tf[:3, :3] @ base_local_delta
+    
+    # 1. сделать проезд до чашки/точки, с небольшим запасом (Margin +4cm)
+    if np.linalg.norm(base_transfer_delta) > 1e-3:
+        dir_vec = base_transfer_delta / np.linalg.norm(base_transfer_delta)
+        base_transfer_delta += dir_vec * 0.04
     print("base transfer world:", np.round(base_transfer_delta, 4))
-    # print("base transfer local:", np.round(base_local_delta, 4))
     print("base +X world:", np.round(base_tf[:3, 0], 4))
     print("base +Y world:", np.round(base_tf[:3, 1], 4))
     if np.linalg.norm(base_transfer_delta) > 1e-3:
@@ -103,7 +107,6 @@ def planning(env, seed, debug=False, vis=None) -> bool:
         )
         if np.cross(base_x_axis, transfer_direction)[2] < 0:
             base_turn_angle = -base_turn_angle
-
         if abs(base_turn_angle) < np.deg2rad(2.0):
             base_forward_delta = base_x_axis * base_transfer_delta[0]
             base_target_pos = base_pos_for_drive + base_forward_delta
@@ -127,6 +130,32 @@ def planning(env, seed, debug=False, vis=None) -> bool:
             planner.drive_base(target_pos=base_target_pos)
         planner.planner.update_from_simulation()
 
+
+    print("Aligning arm over the bowl (transit step)")
+    cup_pos = unwenv.cup.pose.p[0].cpu().numpy()
+    bowl_pos = unwenv.bowl.pose.p[0].cpu().numpy()
+    dx = bowl_pos[0] - cup_pos[0]
+    dy = bowl_pos[1] - cup_pos[1]
+    
+    if np.hypot(dx, dy) > 0.005:
+        print(f"Correction needed: dx={dx:.4f}, dy={dy:.4f}")
+        current_tcp_pose = agent.tcp.pose.sp
+        target_tcp_p = current_tcp_pose.p.copy()
+        target_tcp_p[0] += dx
+        target_tcp_p[1] += dy
+        
+        import mplib
+        result = planner.planner.plan_screw(
+            mplib.Pose(target_tcp_p, current_tcp_pose.q),
+            planner.robot.get_qpos().cpu().numpy()[0],
+            time_step=planner.base_env.control_timestep,
+            masked_joints=[True, True, True, False] + [False]*11
+        )
+        if result["status"] == "Success":
+            planner.follow_path(result)
+        else:
+            print("Alignment screw failed:", result["status"])
+        planner.planner.update_from_simulation()
     planner.render_wait()
 
     print("Lower cup (Smooth vertical movement)")
