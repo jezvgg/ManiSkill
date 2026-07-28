@@ -118,6 +118,30 @@ class MyRoboCasaSceneTakeItBack(BaseEnv):
         self.agent_pose = Pose.create_from_pq(p=agent_pos, q=q)
         self.agent.robot.set_pose(self.agent_pose)
 
+        with torch.device(self.device):
+            if not hasattr(self, "placed_on_sink") or self.placed_on_sink.shape[0] != self.num_envs:
+                self.placed_on_sink = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self.placed_on_sink[env_idx] = False
+
+    def evaluate(self):
+        cup_pos = self.cup.pose.p
+        is_grasped = self.agent.is_grasping(self.cup)
+
+        cup_pos_sink = torch.as_tensor(self.cup_pos_sink, device=self.device)
+        xy_dist_sink = torch.linalg.norm(cup_pos[:, :2] - cup_pos_sink[:2], dim=1)
+        z_dist_sink = torch.abs(cup_pos[:, 2] - cup_pos_sink[2])
+
+        is_on_sink = (xy_dist_sink <= 0.15) & (z_dist_sink <= 0.10) & (~is_grasped)
+        self.placed_on_sink = self.placed_on_sink | is_on_sink
+
+        cup_pos_init = torch.as_tensor(self.cup_pos, device=self.device)
+        xy_dist_init = torch.linalg.norm(cup_pos[:, :2] - cup_pos_init[:2], dim=1)
+        z_dist_init = torch.abs(cup_pos[:, 2] - cup_pos_init[2])
+
+        returned_to_initial = (xy_dist_init <= 0.15) & (z_dist_init <= 0.10) & (~is_grasped)
+
+        success = self.placed_on_sink & returned_to_initial
+        return dict(success=success)
 
     @property
     def _default_sensor_configs(self):

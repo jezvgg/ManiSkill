@@ -1,4 +1,4 @@
-import os
+import argparse
 import random
 
 import gymnasium as gym
@@ -16,6 +16,19 @@ from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
 from mani_skill.utils.wrappers.record import RecordEpisode
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Motion planner for MyRoboCasa_TakeItBack-v1 scene")
+    parser.add_argument("--seed", type=int, default=3, help="Random seed (default: 3)")
+    parser.add_argument("--output-dir", type=str, default="videos",
+                        help="Directory for video output (default: videos)")
+    parser.add_argument("--render-mode", type=str, default="rgb_array",
+                        choices=["rgb_array", "human", "sensors"],
+                        help="Render mode (default: rgb_array)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode in planner")
+    parser.add_argument("--info", action="store_true", help="Print environment info in planner")
+    return parser.parse_args()
 
 
 def move_base_backward_smooth(env, planner, target_base_pos, max_steps=200, eps=0.015, vis=False):
@@ -292,26 +305,28 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
 
 if __name__ == "__main__":
-    SEED = 3
+    args = parse_args()
+    SEED = args.seed
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    output_dir = "videos"
-    print(f"[INFO] Initializing environment with video recording in directory '{output_dir}'...")
+    print(f"[INFO] seed={SEED}, output_dir='{args.output_dir}', render_mode='{args.render_mode}', "
+          f"debug={args.debug}, info={args.info}")
+
     env = gym.make(
         "MyRoboCasa_TakeItBack-v1",
         num_envs=1,
-        render_mode="rgb_array",
+        render_mode=args.render_mode,
         obs_mode="rgb",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
     )
     env = RecordEpisode(
         env,
-        output_dir=output_dir,
+        output_dir=args.output_dir,
         save_trajectory=False,
         save_video=True,
         video_fps=30,
@@ -319,6 +334,6 @@ if __name__ == "__main__":
     )
 
     env.action_space.seed(SEED)
-    planning(env, SEED, debug=False, info=True)
+    planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
-    print(f"[INFO] Video recording saved in '{output_dir}/'")
+    print(f"[INFO] Video recording saved in '{args.output_dir}/'")

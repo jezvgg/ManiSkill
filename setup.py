@@ -40,7 +40,7 @@ def get_dependencies():
         "trimesh",
         "imageio",
         "imageio[ffmpeg]",
-        "mplib==0.1.1;platform_system=='Linux'",
+        "mplib==0.2.1;platform_system=='Linux'",
         "fast_kinematics==0.2.2;platform_system=='Linux'",
         "IPython",
         "pytorch_kinematics==0.7.6",
@@ -92,13 +92,14 @@ def main(argv):
         long_description_content_type="text/markdown",
         author="ManiSkill contributors",
         url="https://github.com/haosulab/ManiSkill",
-        packages=find_packages(include=["mani_skill*"]),
+        packages=find_packages(include=["mani_skill*", "my_scenes*"]),
         python_requires=">=3.9",
         setup_requires=["setuptools>=62.3.0"],
         install_requires=get_dependencies(),
         # Glob patterns do not automatically match dotfiles
         package_data={
             "mani_skill": ["assets/**", "envs/**/*", "utils/**/*"],
+            "my_scenes": ["*"],
             "warp_maniskill.warp": ["native/*", "native/nanovdb/*"],
         },
         extras_require={
