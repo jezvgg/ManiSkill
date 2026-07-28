@@ -18,3 +18,4 @@ from .push_t import PushTEnv
 from .pull_cube_tool import PullCubeToolEnv
 from .stack_pyramid import StackPyramidEnv
 from .my_robocasa import MyRoboCasaScene
+from .my_robocasa_takeitback import MyRoboCasaSceneTakeItBack

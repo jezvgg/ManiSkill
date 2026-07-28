@@ -18,7 +18,7 @@ from mani_skill.examples.motionplanning.fetch.utils import (
 from mani_skill.utils.wrappers.record import RecordEpisode
 
 
-def planning(env, seed, debug=False, vis=None) -> bool:
+def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     if vis is None:
         vis = (env.unwrapped.render_mode == "human")
     unwenv: MyRoboCasaScene = env.unwrapped
@@ -29,7 +29,7 @@ def planning(env, seed, debug=False, vis=None) -> bool:
         env,
         base_pose=agent.robot.pose,
         vis=vis,
-        print_env_info=True,
+        print_env_info=info,
         debug=debug,
     )
 
@@ -70,7 +70,7 @@ def planning(env, seed, debug=False, vis=None) -> bool:
     base_pos = agent.base_link.pose.p[0].cpu().numpy()
     target_to_cup = reach_pose.p - cup_center
     base_to_cup = base_pos - cup_center
-    
+
     # Validation: if the target is on the far side of the cup relative to the robot base
     if np.dot(target_to_cup, base_to_cup) < 0:
         print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
@@ -91,7 +91,7 @@ def planning(env, seed, debug=False, vis=None) -> bool:
 
     print("Reaching cup")
     res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
-    
+
     if res == -1:
         print("Reaching cup failed, trying opposite closing direction as fallback...")
         grasp_info = compute_box_grasp_thin_side_info(
@@ -129,7 +129,7 @@ def planning(env, seed, debug=False, vis=None) -> bool:
     bowl_center_local = world_to_base_rot @ (bowl_center - base_tf[:3, 3])
     base_transfer_delta = bowl_center_local - cup_center_local
     base_transfer_delta[2] = 0.0
-    
+
     # 1. сделать проезд до чашки/точки, с небольшим запасом (Margin +4cm)
     if np.linalg.norm(base_transfer_delta) > 1e-3:
         dir_vec = base_transfer_delta / np.linalg.norm(base_transfer_delta)
@@ -176,14 +176,14 @@ def planning(env, seed, debug=False, vis=None) -> bool:
     bowl_pos = unwenv.bowl.pose.p[0].cpu().numpy()
     dx = bowl_pos[0] - cup_pos[0]
     dy = bowl_pos[1] - cup_pos[1]
-    
+
     if np.hypot(dx, dy) > 0.005:
         print(f"Correction needed: dx={dx:.4f}, dy={dy:.4f}")
         current_tcp_pose = agent.tcp.pose.sp
         target_tcp_p = current_tcp_pose.p.copy()
         target_tcp_p[0] += dx
         target_tcp_p[1] += dy
-        
+
         import mplib
         result = planner.planner.plan_screw(
             mplib.Pose(target_tcp_p, current_tcp_pose.q),
