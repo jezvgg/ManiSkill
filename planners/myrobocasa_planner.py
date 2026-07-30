@@ -17,6 +17,12 @@ from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
 from mani_skill.utils.wrappers.record import RecordEpisode
+from utils.planners_utils import (
+    lower_torso_smooth,
+    retract_arm_lift_torso,
+    align_arm_over_target,
+    drive_base_to_object_target,
+)
 
 
 def parse_args():
@@ -137,113 +143,17 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     planner.planner.update_from_simulation()
 
     print("Drive base toward bowl")
-    base_tf = agent.base_link.pose.sp.to_transformation_matrix()
-    world_to_base_rot = base_tf[:3, :3].T
-    cup_center_local = world_to_base_rot @ (cup_center - base_tf[:3, 3])
-    bowl_center_local = world_to_base_rot @ (bowl_center - base_tf[:3, 3])
-    base_transfer_delta = bowl_center_local - cup_center_local
-    base_transfer_delta[2] = 0.0
-
-    # 1. сделать проезд до чашки/точки, с небольшим запасом (Margin +4cm)
-    if np.linalg.norm(base_transfer_delta) > 1e-3:
-        dir_vec = base_transfer_delta / np.linalg.norm(base_transfer_delta)
-        base_transfer_delta += dir_vec * 0.04
-    print("base transfer world:", np.round(base_transfer_delta, 4))
-    print("base +X world:", np.round(base_tf[:3, 0], 4))
-    print("base +Y world:", np.round(base_tf[:3, 1], 4))
-    if np.linalg.norm(base_transfer_delta) > 1e-3:
-        base_pos_for_drive = planner.base_env.agent.base_link.pose.sp.p.copy()
-        base_x_axis = base_tf[:3, 0]
-        base_x_axis = base_x_axis / np.linalg.norm(base_x_axis)
-        transfer_direction = base_transfer_delta / np.linalg.norm(base_transfer_delta)
-        base_turn_angle = np.arccos(
-            np.clip(np.dot(base_x_axis, transfer_direction), -1.0, 1.0)
-        )
-        if np.cross(base_x_axis, transfer_direction)[2] < 0:
-            base_turn_angle = -base_turn_angle
-        if abs(base_turn_angle) < np.deg2rad(2.0):
-            base_forward_delta = base_x_axis * base_transfer_delta[0]
-            base_target_pos = base_pos_for_drive + base_forward_delta
-            print(
-                "scene base move mode: forward",
-                "angle deg:",
-                np.round(np.rad2deg(base_turn_angle), 4),
-            )
-            print("scene base_pos_for_drive:", np.round(base_pos_for_drive, 4))
-            print("scene base_target_pos:", np.round(base_target_pos, 4))
-            planner.move_base_forward(base_target_pos, n_init_qpos=100)
-        else:
-            base_target_pos = base_pos_for_drive + base_transfer_delta
-            print(
-                "scene base move mode: drive_base",
-                "angle deg:",
-                np.round(np.rad2deg(base_turn_angle), 4),
-            )
-            print("scene base_pos_for_drive:", np.round(base_pos_for_drive, 4))
-            print("scene base_target_pos:", np.round(base_target_pos, 4))
-            planner.drive_base(target_pos=base_target_pos)
-        planner.planner.update_from_simulation()
+    drive_base_to_object_target(env, planner, cup_center, bowl_center, margin=0.04)
 
 
     print("Aligning arm over the bowl (transit step)")
     cup_pos = unwenv.cup.pose.p[0].cpu().numpy()
     bowl_pos = unwenv.bowl.pose.p[0].cpu().numpy()
-    dx = bowl_pos[0] - cup_pos[0]
-    dy = bowl_pos[1] - cup_pos[1]
-
-    if np.hypot(dx, dy) > 0.005:
-        print(f"Correction needed: dx={dx:.4f}, dy={dy:.4f}")
-        current_tcp_pose = agent.tcp.pose.sp
-        target_tcp_p = current_tcp_pose.p.copy()
-        target_tcp_p[0] += dx
-        target_tcp_p[1] += dy
-
-        import mplib
-        result = planner.planner.plan_screw(
-            mplib.Pose(target_tcp_p, current_tcp_pose.q),
-            planner.robot.get_qpos().cpu().numpy()[0],
-            time_step=planner.base_env.control_timestep,
-            masked_joints=[True, True, True, False] + [False]*11
-        )
-        if result["status"] == "Success":
-            planner.follow_path(result)
-        else:
-            print("Alignment screw failed:", result["status"])
-        planner.planner.update_from_simulation()
-    planner.render_wait()
+    align_arm_over_target(env, planner, cup_pos, bowl_pos, vis=vis)
 
     print("Lower cup (Smooth vertical movement)")
-    unw_env = env.unwrapped
-    arm_action = unw_env.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-
-    # Запоминаем НАЧАЛЬНОЕ состояние тела перед опусканием
-    start_body_action = (
-        unw_env.agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
-    )
-
-    base_action = np.array([0.0, 0.0])
-    gripper_action = planner.gripper_state
-
-    # Настройки скорости:
-    # 100 шагов сделают движение очень осторожным и плавным
-    total_steps = 100
-    target_drop = 0.17  # Всего нужно опустить на 7 см
-
-    for step in range(total_steps):
-        # Вычисляем промежуточную цель на текущем шаге
-        fraction = (step + 1) / total_steps
-        current_drop = fraction * target_drop
-
-        # Обновляем только высоту торса от начальной точки
-        body_action = start_body_action.copy()
-        body_action[2] -= current_drop
-
-        # Собираем экшен и шагаем
-        action = np.hstack([arm_action, gripper_action, body_action, base_action])
-        obs, reward, terminated, truncated, info = env.step(action)
-
-        if vis and hasattr(unw_env, "render_human"):
-            unw_env.render_human()
+    arm_action = unwenv.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+    lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=vis, arm_action=arm_action)
 
     # Синхронизируем планер
     planner.planner.update_from_simulation()
@@ -253,14 +163,7 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     planner.planner.update_from_simulation()
 
     print("Retract arm (Bypassing planner to lift torso back up)")
-    # Поднимаем торс обратно вверх на 15 см, чтобы гарантированно выйти из миски
-    body_action[2] += 0.15
-    action = np.hstack([arm_action, planner.gripper_state, body_action, base_action])
-
-    for _ in range(40):
-        env.step(action)
-        if vis and hasattr(unw_env, "render_human"):
-            unw_env.render_human()
+    retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis, arm_action=arm_action)
 
     planner.planner.update_from_simulation()
 
