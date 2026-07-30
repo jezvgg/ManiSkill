@@ -79,18 +79,23 @@ class MyRoboCasaSceneTakeItBack(BaseRoboCasaScene):
         cup_pos = self.cup.pose.p
         is_grasped = self.agent.is_grasping(self.cup)
 
+        # Check if the cup is currently resting / static
+        v = torch.linalg.norm(self.cup.linear_velocity, dim=1)
+        av = torch.linalg.norm(self.cup.angular_velocity, dim=1)
+        is_static = (v <= 0.1) & (av <= 0.2)
+
         cup_pos_sink = torch.as_tensor(self.cup_pos_sink, device=self.device)
         xy_dist_sink = torch.linalg.norm(cup_pos[:, :2] - cup_pos_sink[:2], dim=1)
         z_dist_sink = torch.abs(cup_pos[:, 2] - cup_pos_sink[2])
 
-        is_on_sink = (xy_dist_sink <= 0.15) & (z_dist_sink <= 0.10) & (~is_grasped)
+        is_on_sink = (xy_dist_sink <= 0.15) & (z_dist_sink <= 0.10) & (~is_grasped) & is_static
         self.placed_on_sink = self.placed_on_sink | is_on_sink
 
         cup_pos_init = torch.as_tensor(self.cup_pos, device=self.device)
         xy_dist_init = torch.linalg.norm(cup_pos[:, :2] - cup_pos_init[:2], dim=1)
         z_dist_init = torch.abs(cup_pos[:, 2] - cup_pos_init[2])
 
-        returned_to_initial = (xy_dist_init <= 0.15) & (z_dist_init <= 0.10) & (~is_grasped)
+        returned_to_initial = (xy_dist_init <= 0.15) & (z_dist_init <= 0.10) & (~is_grasped) & is_static
 
         success = self.placed_on_sink & returned_to_initial
         return dict(success=success)

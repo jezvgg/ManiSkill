@@ -173,8 +173,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
     retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis)
 
     print("Task completed. Closing env...")
+    success = bool(unwenv.evaluate()["success"].item())
+    print("Success:", success)
     env.reset()
-    return True
+    return success
 
 
 if __name__ == "__main__":
