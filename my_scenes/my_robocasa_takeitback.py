@@ -1,26 +1,18 @@
 import os
-
 import numpy as np
 import sapien
 import torch
-
 from mani_skill import ASSET_DIR
-from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
-from mani_skill.utils.geometry.rotation_conversions import axis_angle_to_quaternion
 from mani_skill.utils.registration import register_env
-from mani_skill.utils.scene_builder.robocasa.scene_builder import RoboCasaSceneBuilder
 from mani_skill.utils.structs import Actor, Pose
-
-from .my_robocasa import get_actor_size, degree_to_quanterion
-
+from .base_robocasa import BaseRoboCasaScene
+from utils.scene_utils import get_actor_size, degree_to_quanterion
 
 @register_env("MyRoboCasa_TakeItBack-v1", asset_download_ids=["RoboCasa"])
-class MyRoboCasaSceneTakeItBack(BaseEnv):
-    SUPPORTED_ROBOTS = ["fetch", "none"]
-    SUPPORTED_REWARD_MODES = ["none"]
-
+class MyRoboCasaSceneTakeItBack(BaseRoboCasaScene):
+    FIXTURE_SEED = 102
     fxtr_placements: dict[str, dict[str, object]]
     cup_pos: tuple[int, int, int]
     cup_pos_sink: tuple[int, int, int]
@@ -30,30 +22,8 @@ class MyRoboCasaSceneTakeItBack(BaseEnv):
 
     cup: Actor
 
-
-    def __init__(self, robot_uids="fetch", *args, **kwargs):
-        super().__init__(robot_uids=robot_uids, *args, **kwargs)
-        self.fxtr_placements = {}
-
-
     def _load_scene(self, options: dict):
         super()._load_scene(options)
-        self._set_episode_rng(102, torch.arange(self.num_envs))
-        self.scene_builder = RoboCasaSceneBuilder(self)
-        self.scene_builder.build()
-        self.fixture_placements = {
-            config["name"]
-            + "_"
-            + getattr(
-                getattr(config["model"], "__class__", None), "__name__", "Wrong"
-            ): {
-                "pos": getattr(config["model"], "pos", None),
-                "quat": getattr(config["model"], "quat", None),
-                "size": getattr(config["model"], "size", None),
-            }
-            for config in self.scene_builder.scene_data[0].get("fixture_cfgs")
-        }
-
         cup_path = os.path.join(
             ASSET_DIR,
             "scene_datasets/robocasa_dataset/assets/objects/objaverse/cup/cup_2/model.xml",
@@ -61,20 +31,12 @@ class MyRoboCasaSceneTakeItBack(BaseEnv):
         loader = self.scene.create_mjcf_loader()
         loader.visual_groups = [1]
 
-        self.counter_pos = self.fixture_placements["counter_main_main_group_Counter"][
-            "pos"
-        ]
-        self.counter_size = self.fixture_placements["counter_main_main_group_Counter"][
-            "size"
-        ]
-
         self.sink_pos = self.fixture_placements["sink_main_group_Sink"][
             "pos"
         ]
         self.sink_size = self.fixture_placements["sink_main_group_Sink"][
             "size"
         ]
-
         builder = loader.parse(str(cup_path), package_dir=os.path.dirname(cup_path))[
             "actor_builders"
         ][0]
@@ -108,16 +70,6 @@ class MyRoboCasaSceneTakeItBack(BaseEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         super()._initialize_episode(env_idx, options)
-        agent_pos = self.agent.robot.pose.p[0]
-        agent_pos[0] = self.cup_pos[0]
-        agent_pos[1] = self.cup_pos[1]
-        agent_pos[1] -= self.counter_size[1] * 1.6
-
-        q = degree_to_quanterion(z=180)
-
-        self.agent_pose = Pose.create_from_pq(p=agent_pos, q=q)
-        self.agent.robot.set_pose(self.agent_pose)
-
         with torch.device(self.device):
             if not hasattr(self, "placed_on_sink") or self.placed_on_sink.shape[0] != self.num_envs:
                 self.placed_on_sink = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -127,18 +79,23 @@ class MyRoboCasaSceneTakeItBack(BaseEnv):
         cup_pos = self.cup.pose.p
         is_grasped = self.agent.is_grasping(self.cup)
 
+        # Check if the cup is currently resting / static
+        v = torch.linalg.norm(self.cup.linear_velocity, dim=1)
+        av = torch.linalg.norm(self.cup.angular_velocity, dim=1)
+        is_static = (v <= 0.1) & (av <= 0.2)
+
         cup_pos_sink = torch.as_tensor(self.cup_pos_sink, device=self.device)
         xy_dist_sink = torch.linalg.norm(cup_pos[:, :2] - cup_pos_sink[:2], dim=1)
         z_dist_sink = torch.abs(cup_pos[:, 2] - cup_pos_sink[2])
 
-        is_on_sink = (xy_dist_sink <= 0.15) & (z_dist_sink <= 0.10) & (~is_grasped)
+        is_on_sink = (xy_dist_sink <= 0.15) & (z_dist_sink <= 0.10) & (~is_grasped) & is_static
         self.placed_on_sink = self.placed_on_sink | is_on_sink
 
         cup_pos_init = torch.as_tensor(self.cup_pos, device=self.device)
         xy_dist_init = torch.linalg.norm(cup_pos[:, :2] - cup_pos_init[:2], dim=1)
         z_dist_init = torch.abs(cup_pos[:, 2] - cup_pos_init[2])
 
-        returned_to_initial = (xy_dist_init <= 0.15) & (z_dist_init <= 0.10) & (~is_grasped)
+        returned_to_initial = (xy_dist_init <= 0.15) & (z_dist_init <= 0.10) & (~is_grasped) & is_static
 
         success = self.placed_on_sink & returned_to_initial
         return dict(success=success)
