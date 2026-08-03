@@ -16,6 +16,7 @@ from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
 from mani_skill.utils.wrappers.record import RecordEpisode
+from utils.logging_utils import PlannerLogger, capture_stdout
 from utils.planners_utils import (
     lower_torso_smooth,
     retract_arm_lift_torso,
@@ -34,6 +35,8 @@ def parse_args():
                         help="Render mode (default: rgb_array)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode in planner")
     parser.add_argument("--info", action="store_true", help="Print environment info in planner")
+    parser.add_argument("--log-dir", type=str, default="logs", help="Directory for log output (default: logs)")
+    parser.add_argument("--log-freq", type=int, default=10, help="Write trajectory rows every N steps (default: 10)")
     return parser.parse_args()
 
 
@@ -51,6 +54,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
         print_env_info=info,
         debug=debug,
     )
+    env.track_object(unwenv.cup, "cup")
+    env.track_object(agent.tcp, "robot_tcp")
+    env.track_object(agent.base_link, "robot_base")
+    env.log_event("start", "Planning started")
     print("Calculate grasp position")
     mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
     if mesh is not None:
@@ -59,8 +66,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     planner.planner.update_from_simulation()
 
-    tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
-    ee_direction = obb.center_mass - tcp_pos
+    base_pos = agent.base_link.pose.p[0].cpu().numpy()
+    ee_direction = obb.center_mass - base_pos
+    ee_direction[2] = 0
     ee_direction = ee_direction / np.linalg.norm(ee_direction)
     target_closing = agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
 
@@ -83,32 +91,76 @@ def planning(env, seed, debug=False, vis=None, info=False):
     target_to_cup = reach_pose.p - cup_center
     base_to_cup = base_pos - cup_center
 
-    print("Reaching cup")
-    res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
-    planner.planner.update_from_simulation()
+    if np.dot(target_to_cup, base_to_cup) < 0:
+        print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
+        env.log_event("warn", "Grasp is diametrically opposite, flipping approaching direction")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction,
+            target_closing=target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+        target_to_cup = reach_pose.p - cup_center
 
+    print("Reaching cup")
+    env.log_event("phase", "Reaching cup")
+    res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
+
+    if res == -1:
+        print("Reaching cup failed, trying opposite closing direction as fallback...")
+        env.log_event("warn", "Reaching cup failed, trying opposite closing direction as fallback")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction if np.dot(target_to_cup, base_to_cup) < 0 else ee_direction,
+            target_closing=-target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+        res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
     print("Grasp cup")
+    env.log_event("phase", "Grasp cup")
     grasp_cup = grasp_pose
-    planner.static_manipulation(grasp_cup, disable_lift_joint=False)
+    env.log_motion("Grasp cup", planner.static_manipulation, grasp_cup, disable_lift_joint=False)
     planner.close_gripper()
     planner.planner.update_from_simulation()
 
     print("Lift cup")
+    env.log_event("phase", "Lift cup")
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
-    planner.static_manipulation(lift_pose, disable_lift_joint=False)
+    env.log_motion("Lift cup", planner.static_manipulation, lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("\n--- Phase 1: Drive base toward sink ---")
+    env.log_event("phase", "Phase 1: Drive base toward sink")
     initial_base_pos = agent.base_link.pose.sp.p.copy()
-    drive_base_to_object_target(env, planner, cup_center, unwenv.cup_pos_sink, margin=0.04)
+    env.log_motion("Drive base to sink", drive_base_to_object_target, env, planner, cup_center, unwenv.cup_pos_sink, margin=0.04)
     print("Lower cup (Smooth vertical movement)")
+    env.log_event("phase", "Lower cup (smooth vertical movement)")
     lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=vis)
 
     print("Release cup")
+    env.log_event("phase", "Release cup")
     planner.open_gripper()
     planner.planner.update_from_simulation()
 
     print("Retract arm (Bypassing planner to lift torso back up)")
+    env.log_event("phase", "Retract arm (bypassing planner to lift torso up)")
     retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis)
 
     print("Calculate grasp position")
@@ -119,8 +171,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     planner.planner.update_from_simulation()
 
-    tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
-    ee_direction = obb.center_mass - tcp_pos
+    base_pos = agent.base_link.pose.p[0].cpu().numpy()
+    ee_direction = obb.center_mass - base_pos
+    ee_direction[2] = 0
     ee_direction = ee_direction / np.linalg.norm(ee_direction)
     target_closing = agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
 
@@ -143,38 +196,83 @@ def planning(env, seed, debug=False, vis=None, info=False):
     target_to_cup = reach_pose.p - cup_center
     base_to_cup = base_pos - cup_center
 
-    print("Reaching cup")
-    res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
-    planner.planner.update_from_simulation()
+    if np.dot(target_to_cup, base_to_cup) < 0:
+        print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
+        env.log_event("warn", "Grasp is diametrically opposite, flipping approaching direction")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction,
+            target_closing=target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+        target_to_cup = reach_pose.p - cup_center
 
+    print("Reaching cup")
+    env.log_event("phase", "Reaching cup")
+    res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
+
+    if res == -1:
+        print("Reaching cup failed, trying opposite closing direction as fallback...")
+        env.log_event("warn", "Reaching cup failed, trying opposite closing direction as fallback")
+        grasp_info = compute_box_grasp_thin_side_info(
+            obb,
+            ee_direction=-ee_direction if np.dot(target_to_cup, base_to_cup) < 0 else ee_direction,
+            target_closing=-target_closing,
+            depth=FINGER_LENGTH,
+            ortho=True,
+        )
+        closing, center, approaching = (
+            grasp_info["closing"],
+            grasp_info["center"],
+            grasp_info["approaching"],
+        )
+        grasp_pose = agent.build_grasp_pose(approaching, closing, center)
+        reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
+        res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
+    planner.planner.update_from_simulation()
     print("Grasp cup")
+    env.log_event("phase", "Grasp cup")
     grasp_cup = grasp_pose
-    planner.static_manipulation(grasp_cup, disable_lift_joint=False)
+    env.log_motion("Grasp cup", planner.static_manipulation, grasp_cup, disable_lift_joint=False)
     planner.close_gripper()
     planner.planner.update_from_simulation()
 
     print("Lift cup")
+    env.log_event("phase", "Lift cup")
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
-    planner.static_manipulation(lift_pose, disable_lift_joint=False)
+    env.log_motion("Lift cup", planner.static_manipulation, lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("\n--- Phase 2: Drive base backward to initial position (table) ---")
+    env.log_event("phase", "Phase 2: Drive base backward to initial position")
     planner.planner.update_from_simulation()
     cur_base_p = planner.base_env.agent.base_link.pose.sp.p.copy()
-    move_base_backward_smooth(env, planner, initial_base_pos, vis=vis)
+    env.log_motion("Move base backward", move_base_backward_smooth, env, planner, initial_base_pos, vis=vis)
     print("Lower cup (Smooth vertical movement)")
+    env.log_event("phase", "Lower cup (smooth vertical movement)")
     lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=vis)
 
     print("Release cup")
+    env.log_event("phase", "Release cup")
     planner.open_gripper()
     planner.planner.update_from_simulation()
 
     print("Retract arm (Bypassing planner to lift torso back up)")
+    env.log_event("phase", "Retract arm (bypassing planner to lift torso up)")
     retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis)
 
     print("Task completed. Closing env...")
     success = bool(unwenv.evaluate()["success"].item())
     print("Success:", success)
+    env.log_event("result", "Task completed", success=success)
     env.reset()
     return success
 
@@ -207,8 +305,10 @@ if __name__ == "__main__":
         video_fps=30,
         trajectory_name="take_it_back",
     )
+    env = PlannerLogger(env, log_dir=args.log_dir, name=f"takeitback_seed{SEED}", log_freq=args.log_freq)
 
     env.action_space.seed(SEED)
-    planning(env, SEED, debug=args.debug, info=args.info)
+    with capture_stdout(env.dir / "console.log"):
+        planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
     print(f"[INFO] Video recording saved in '{args.output_dir}/'")

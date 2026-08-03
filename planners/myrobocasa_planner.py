@@ -17,6 +17,7 @@ from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
 from mani_skill.utils.wrappers.record import RecordEpisode
+from utils.logging_utils import PlannerLogger, capture_stdout
 from utils.planners_utils import (
     lower_torso_smooth,
     retract_arm_lift_torso,
@@ -35,6 +36,8 @@ def parse_args():
                         help="Render mode (default: rgb_array)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode in planner")
     parser.add_argument("--info", action="store_true", help="Print environment info in planner")
+    parser.add_argument("--log-dir", type=str, default="logs", help="Directory for log output (default: logs)")
+    parser.add_argument("--log-freq", type=int, default=10, help="Write trajectory rows every N steps (default: 10)")
     return parser.parse_args()
 
 
@@ -65,8 +68,13 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
 
     planner.planner.update_from_simulation()
 
+    env.track_object(unwenv.cup, "cup")
+    env.track_object(unwenv.bowl, "bowl")
+    env.track_object(agent.tcp, "robot_tcp")
+    env.log_event("start", "Planning started")
 
     print("Calculate grasp position")
+    env.log_event("grasp", "Calculate grasp position")
     tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
     ee_direction = obb.center_mass - tcp_pos
     ee_direction = ee_direction / np.linalg.norm(ee_direction)
@@ -94,6 +102,7 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     # Validation: if the target is on the far side of the cup relative to the robot base
     if np.dot(target_to_cup, base_to_cup) < 0:
         print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
+        env.log_event("warn", "Grasp is diametrically opposite, flipping approaching direction")
         grasp_info = compute_box_grasp_thin_side_info(
             obb,
             ee_direction=-ee_direction,
@@ -110,10 +119,12 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
         reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
 
     print("Reaching cup")
-    res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
+    env.log_event("phase", "Reaching cup")
+    res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
 
     if res == -1:
         print("Reaching cup failed, trying opposite closing direction as fallback...")
+        env.log_event("warn", "Reaching cup failed, trying opposite closing direction as fallback")
         grasp_info = compute_box_grasp_thin_side_info(
             obb,
             ee_direction=-ee_direction if np.dot(target_to_cup, base_to_cup) < 0 else ee_direction,
@@ -128,30 +139,35 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
         )
         grasp_pose = agent.build_grasp_pose(approaching, closing, center)
         reach_pose = grasp_pose * sapien.Pose([0, 0, -0.1])
-        res = planner.static_manipulation(reach_pose, disable_lift_joint=False)
+        res = env.log_motion("Reach cup", planner.static_manipulation, reach_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("Grasp cup")
+    env.log_event("phase", "Grasp cup")
     grasp_cup = grasp_pose
-    planner.static_manipulation(grasp_cup, disable_lift_joint=False)
+    env.log_motion("Grasp cup", planner.static_manipulation, grasp_cup, disable_lift_joint=False)
     planner.close_gripper()
     planner.planner.update_from_simulation()
 
     print("Lift cup")
+    env.log_event("phase", "Lift cup")
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, 0.15]), grasp_pose.q)
-    planner.static_manipulation(lift_pose, disable_lift_joint=False)
+    env.log_motion("Lift cup", planner.static_manipulation, lift_pose, disable_lift_joint=False)
     planner.planner.update_from_simulation()
 
     print("Drive base toward bowl")
-    drive_base_to_object_target(env, planner, cup_center, bowl_center, margin=0.04)
+    env.log_event("phase", "Drive base toward bowl")
+    env.log_motion("Drive base to bowl", drive_base_to_object_target, env, planner, cup_center, bowl_center, margin=0.04)
 
 
     print("Aligning arm over the bowl (transit step)")
+    env.log_event("phase", "Aligning arm over the bowl")
     cup_pos = unwenv.cup.pose.p[0].cpu().numpy()
     bowl_pos = unwenv.bowl.pose.p[0].cpu().numpy()
-    align_arm_over_target(env, planner, cup_pos, bowl_pos, vis=vis)
+    env.log_motion("Align arm over bowl", align_arm_over_target, env, planner, cup_pos, bowl_pos, vis=vis)
 
     print("Lower cup (Smooth vertical movement)")
+    env.log_event("phase", "Lower cup (smooth vertical movement)")
     arm_action = unwenv.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
     lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=vis, arm_action=arm_action)
 
@@ -159,10 +175,12 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     planner.planner.update_from_simulation()
 
     print("Release cup")
+    env.log_event("phase", "Release cup")
     planner.open_gripper()
     planner.planner.update_from_simulation()
 
     print("Retract arm (Bypassing planner to lift torso back up)")
+    env.log_event("phase", "Retract arm (bypassing planner to lift torso up)")
     retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis, arm_action=arm_action)
 
     planner.planner.update_from_simulation()
@@ -170,6 +188,7 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     print("Task completed. Closing env...")
     success = unwenv.evaluate()["success"]
     print("Success:", success[0])
+    env.log_event("result", "Task completed", success=bool(success[0]))
     env.reset()
     return success
 
@@ -200,6 +219,8 @@ if __name__ == "__main__":
         video_fps=30,
         save_on_reset=True,
     )
+    env = PlannerLogger(env, log_dir=args.log_dir, name=f"myrobocasa_seed{SEED}", log_freq=args.log_freq)
     env.action_space.seed(SEED)
-    planning(env, SEED, debug=args.debug, info=args.info)
+    with capture_stdout(env.dir / "console.log"):
+        planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
