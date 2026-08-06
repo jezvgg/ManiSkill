@@ -1,5 +1,7 @@
 import argparse
 import random
+from datetime import datetime
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -28,8 +30,6 @@ from utils.planners_utils import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Motion planner for MyRoboCasa_TakeItBack-v1 scene")
     parser.add_argument("--seed", type=int, default=3, help="Random seed (default: 3)")
-    parser.add_argument("--output-dir", type=str, default="videos",
-                        help="Directory for video output (default: videos)")
     parser.add_argument("--render-mode", type=str, default="rgb_array",
                         choices=["rgb_array", "human", "sensors"],
                         help="Render mode (default: rgb_array)")
@@ -162,6 +162,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     print("Retract arm (Bypassing planner to lift torso back up)")
     env.log_event("phase", "Retract arm (bypassing planner to lift torso up)")
     retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=vis)
+    planner.planner.update_from_simulation()
 
     print("Calculate grasp position")
     mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
@@ -286,8 +287,12 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    print(f"[INFO] seed={SEED}, output_dir='{args.output_dir}', render_mode='{args.render_mode}', "
-          f"debug={args.debug}, info={args.info}")
+    print(f"[INFO] seed={SEED}, render_mode='{args.render_mode}', "
+          f"debug={args.debug}, info={args.info}, log_dir='{args.log_dir}'")
+
+    run_id = f"takeitback_seed{SEED}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = Path(args.log_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     env = gym.make(
         "MyRoboCasa_TakeItBack-v1",
@@ -299,16 +304,16 @@ if __name__ == "__main__":
     )
     env = RecordEpisode(
         env,
-        output_dir=args.output_dir,
+        output_dir=str(run_dir),
         save_trajectory=False,
         save_video=True,
         video_fps=30,
         trajectory_name="take_it_back",
     )
-    env = PlannerLogger(env, log_dir=args.log_dir, name=f"takeitback_seed{SEED}", log_freq=args.log_freq)
+    env = PlannerLogger(env, log_dir=run_dir, name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
 
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):
         planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
-    print(f"[INFO] Video recording saved in '{args.output_dir}/'")
+    print(f"[INFO] Video recording saved in '{run_dir}/'")

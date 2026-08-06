@@ -52,6 +52,8 @@ def retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=F
             unw_env.render_human()
 
     planner.planner.update_from_simulation()
+
+
 def move_base_backward_smooth(env, planner, target_base_pos, max_steps=200, eps=0.015, vis=False):
     """
     Smoothly move the base backward toward target_base_pos using simple velocity control.
@@ -116,7 +118,7 @@ def align_arm_over_target(env, planner, source_pos, target_pos, vis=False):
         else:
             print("[WARNING] Alignment screw failed:", result["status"])
         planner.planner.update_from_simulation()
-    
+
     if hasattr(planner, "render_wait"):
         planner.render_wait()
 
@@ -130,20 +132,20 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos, m
     agent = unwenv.agent
     base_pos_world = agent.base_link.pose.sp.p.copy()
     base_tf = agent.base_link.pose.sp.to_transformation_matrix()
-    
+
     delta_world = target_obj_pos - current_obj_pos
     delta_world[2] = 0.0
     dist = np.linalg.norm(delta_world)
-    
+
     if dist > 1e-3:
         dir_world = delta_world / dist
         delta_world += dir_world * margin
-    
+
     base_target_pos = base_pos_world + delta_world
-    
+
     print(f"[INFO] Helper driving base. Current pos: {base_pos_world}, Target: {base_target_pos}")
     print(f"[INFO] Delta world vector: {delta_world}, distance: {dist:.4f} m")
-    
+
     if dist > 1e-3:
         base_x_axis_world = base_tf[:3, 0]
         base_x_axis_world = base_x_axis_world / np.linalg.norm(base_x_axis_world)
@@ -166,5 +168,5 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos, m
         else:
             print(f"[INFO] Driving base to target_pos: {base_target_pos}")
             planner.drive_base(target_pos=base_target_pos)
-            
+
         planner.planner.update_from_simulation()

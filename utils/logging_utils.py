@@ -80,12 +80,14 @@ class PlannerLogger(gym.Wrapper):
     high-level phases.
     """
 
-    def __init__(self, env, log_dir="logs", name="run", log_freq=10):
+    def __init__(self, env, log_dir="logs", name="run", log_freq=10, run_dir=None):
         super().__init__(env)
         # Each run gets its own timestamped folder, so re-runs never overwrite (or leave
         # stray files from) a previous run with the same name.
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.dir = Path(log_dir) / f"{name}_{stamp}"
+        if run_dir is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = Path(log_dir) / f"{name}_{stamp}"
+        self.dir = Path(run_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.name = name
         self.log_freq = max(1, int(log_freq or 1))
