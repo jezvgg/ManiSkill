@@ -3,11 +3,15 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
+
+from mani_skill.utils import common
 
 """
 Planner logging utilities for multi-step robot manipulation environments.
@@ -213,3 +217,70 @@ class PlannerLogger(gym.Wrapper):
             f"{qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f}\n"
         )
         f.flush()
+
+
+class StreamingVideoRecorder(gym.Wrapper):
+    """Record one mp4 per run by streaming frames into an ffmpeg subprocess.
+
+    Replaces RecordEpisode(save_video=True) for video-only recording: upstream
+    holds every rendered frame in RAM until the episode ends (~12 GB at the
+    2048x2048 render resolution); here each frame goes straight to ffmpeg's
+    stdin, so memory stays at a single frame no matter the episode length.
+    """
+
+    def __init__(self, env, output_dir, video_fps=30, video_name="video.mp4"):
+        super().__init__(env)
+        self.output_path = Path(output_dir) / video_name
+        self.video_fps = video_fps
+        self._proc = None
+        self._disabled = False
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._write_frame()
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, *args, **kwargs):
+        self._finalize()
+        return self.env.reset(*args, **kwargs)
+
+    def close(self):
+        self._finalize()
+        return super().close()
+
+    def _write_frame(self):
+        if self._disabled:
+            return
+        img = common.to_numpy(self.env.render())
+        if img.ndim == 4:
+            if img.shape[0] != 1:
+                raise ValueError("StreamingVideoRecorder supports num_envs=1 only")
+            img = img[0]
+        if self._proc is None:
+            self._start(img.shape[0], img.shape[1])
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
+        except BrokenPipeError:
+            print("[StreamingVideoRecorder] ffmpeg exited, disabling video recording")
+            self._proc = None
+            self._disabled = True
+
+    def _start(self, height, width):
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{width}x{height}", "-r", str(self.video_fps),
+            "-i", "-",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            str(self.output_path),
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    def _finalize(self):
+        if self._proc is None:
+            return
+        self._proc.stdin.close()
+        self._proc.wait()
+        self._proc = None
