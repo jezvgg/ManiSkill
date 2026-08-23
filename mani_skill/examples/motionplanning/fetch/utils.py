@@ -35,6 +35,14 @@ import sys
 import trimesh
 from mani_skill.utils.structs.pose import to_sapien_pose
 from mani_skill.utils.wrappers.record import RecordEpisode
+from .stepping import pose_error
+from .root_frame import (
+    fold_root,
+    is_planar_root,
+    planar_base,
+    unfold_root,
+    unfold_root_rates,
+)
 from mani_skill.trajectory.merge_trajectory import merge_trajectories
 from mani_skill.examples.motionplanning.panda.solutions import solvePushCube, solvePickCube, solveStackCube, solvePegInsertionSide, solvePlugCharger, solvePullCubeTool, solveLiftPegUpright, solvePullCube
 from mani_skill.envs.tasks import PickCubeEnv
@@ -62,11 +70,24 @@ def attach_object(  # type: ignore
 
     Updates ``acm_`` to allow collisions between attached object and touch_links.
 
+    Frame (K53): mplib composes the attached body as ``link_pose_in_base_frame *
+    pose`` and, with ``pose=None``, stores ``link_pose_in_base_frame^-1 *
+    object_pose`` — the articulation's base pose is left out, so with a robot
+    standing away from the world origin the body is drawn right only in the
+    configuration it was attached in (measured 3.296 m off at shoulder_pan +90 deg).
+    ``SapienPlanningWorldV2`` therefore keeps the planned mobile base at the
+    identity base pose with the robot's world pose folded into its root joints
+    (`root_frame.py`); against that world the stored transform is the true
+    ``T_link_obj = link_world^-1 * obj_world`` and mplib draws the body where the
+    hand is, in every configuration. Nothing here changes; call it on a
+    ``SapienPlanningWorldV2`` and sync (`update_from_simulation`) afterwards.
+
     :param obj: the non-articulated object (or its name) to attach
     :param articulation: the planned articulation (or its name) to attach to
     :param link: the link of the planned articulation (or its index) to attach to
-    :param pose: attached pose (relative pose from attached link to object).
-        If ``None``, attach the object at its current pose.
+    :param pose: attached pose (relative pose from attached link to object, in
+        the planning world's frame of that link). If ``None``, attach the object
+        at its current pose.
     :param touch_links: links (or their names) that the attached object touches.
         When ``None``,
 
@@ -222,7 +243,29 @@ def is_mesh_cylindrical(actor, to_world_frame=True, thresh=5e-3):
 
 class SapienPlanningWorldV2(SapienPlanningWorld):
     """
-    Patched version of SapienPlanningWorld for meshes with scale
+    Patched version of SapienPlanningWorld for meshes with scale — and, for a planned
+    articulation with a planar mobile base, the robot's world pose folded into its
+    root joints (K53, `root_frame.py`).
+
+    mplib 0.2.1 draws an attached body at ``link_in_base_frame * attached_pose`` —
+    the articulation's base pose is left out — so with the robot standing away from
+    the world origin a held object orbits the origin as soon as a link rotates
+    (measured 3.296 m from the hand at shoulder_pan +90 deg; docs/lab-journal.md
+    2026-08-18). Here the planned articulation's base pose is kept the identity and
+    ``root_pose * Trans(x, y) * RotZ(yaw)`` is expressed as root-joint values instead,
+    at construction and at every ``update_from_simulation``; then mplib's own
+    ``link.inv() * entity.pose`` *is* the rigid link->object transform and the body is
+    drawn where the hand is in every configuration. ``fold_qpos`` / ``unfold_qpos``
+    are the two-way translation ``SapienPlannerV2`` applies at its boundary, so
+    callers keep passing and receiving simulator qpos. (``unfold_rates`` and
+    ``root_frame.unfold_root_rates`` are kept as tested helpers but are unused since
+    the unfold moved *before* TOPP in ``plan_pose``/``plan_qpos`` — the rates come
+    out of TOPP already in the simulator's frame.)
+
+    ``root_folded`` names the planned articulation that is folded, or None (no
+    planar root joints — a fixed-base arm — or a root pose with height/tilt, which
+    the three planar joints cannot express; then mplib's own framing is kept and
+    ``attach_object`` stays phantom-prone, as before).
     """
     def __init__(
         self,
@@ -238,6 +281,9 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
         mplib.PlanningWorld.__init__(self, [])
         self._sim_scene = sim_scene
         self.disable_actors_collision = disable_actors_collision
+        # name -> the simulator articulation whose root pose is folded into its
+        # root joints (K53); at most the planned articulation.
+        self._folded: dict[str, PhysxArticulation] = {}
 
         articulations: list[PhysxArticulation] = sim_scene.get_all_articulations()
         actors: list[Entity] = sim_scene.get_all_actors()
@@ -254,25 +300,24 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
                     if (fcl_obj := self.convert_physx_component(link)) is not None
                 ]
 
+                joint_names = [j.name for j in articulation.active_joints]
                 articulated_model = mplib.ArticulatedModel.create_from_urdf_string(
                     urdf_str,
                     srdf_str,
                     collision_links=collision_links,
                     gravity=sim_scene.get_physx_system().config.gravity,  # type: ignore
                     link_names=[link.name for link in articulation.links],
-                    joint_names=[j.name for j in articulation.active_joints],
+                    joint_names=joint_names,
                     verbose=False,
                 )
-                articulated_model.set_base_pose(articulation.root_pose)  # type: ignore
-                articulated_model.set_qpos(
-                    articulation.qpos,  # type: ignore
-                    full=True,
-                )  # update qpos
+                if articulation in planned_articulations and self._can_fold(articulation, joint_names):
+                    self._folded[convert_object_name(articulation)] = articulation
+                self._place(articulated_model, articulation)
                 self.add_articulation(articulated_model)
 
         for articulation in planned_articulations:
             self.set_articulation_planned(convert_object_name(articulation), True)
-        
+
         # if not self.disable_actors_collision:
         for entity in actors:
             if self.disable_actors_collision and 'food' in entity.name:
@@ -286,6 +331,119 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
             # Convert collision shapes at current global pose
             if (fcl_obj := self.convert_physx_component(component)) is not None:  # type: ignore
                 self.add_object(fcl_obj)
+
+    # ------------------------------------------------------------ K53: the fold --
+
+    @staticmethod
+    def _can_fold(articulation: PhysxArticulation, joint_names) -> bool:
+        """Planar root joints first in the chain, and a planar root pose.
+
+        ``MIKASA_DISABLE_ROOT_FOLD=1`` forces this to False. It exists to isolate what
+        K53 costs and buys: with the fold off, the planning world keeps mplib's own base
+        representation, which is what jezv's solver uses. **Only safe where nothing is
+        attached** — the fold is what puts a held object in the hand rather than 3.3 m
+        away, so switching it off on a task that carries something reinstates the
+        phantom. The inherited planners call ``attach_object`` zero times, which is why
+        the comparison against them may use it.
+        """
+        if os.environ.get("MIKASA_DISABLE_ROOT_FOLD") == "1":
+            print("[planning world] MIKASA_DISABLE_ROOT_FOLD=1: base pose NOT folded "
+                  "(diagnostic; reinstates mplib's frame error for attached bodies)", flush=True)
+            return False
+        if not is_planar_root(joint_names):
+            return False
+        try:
+            planar_base(articulation.root_pose.p, articulation.root_pose.q)
+        except ValueError as e:
+            print(f"[planning world] {articulation.name}: base pose NOT folded into the root joints "
+                  f"({e}); attached bodies keep mplib's frame error (K53)", flush=True)
+            return False
+        return True
+
+    @property
+    def root_folded(self) -> str | None:
+        """Name of the planned articulation whose root pose is folded, or None."""
+        return next(iter(self._folded), None)
+
+    def _root_pose(self):
+        """`(p, q)` of the folded articulation's simulator root pose, read live."""
+        art = self._folded[self.root_folded]
+        return np.asarray(art.root_pose.p, dtype=np.float64), np.asarray(art.root_pose.q, dtype=np.float64)
+
+    def _place(self, model, articulation: PhysxArticulation) -> None:
+        """Put the planning model where the simulator has the articulation: folded for
+        the planned mobile base, mplib's own `base_pose + qpos` for everything else."""
+        if convert_object_name(articulation) in self._folded:
+            model.set_base_pose(mplib.Pose())
+            model.set_qpos(fold_root(articulation.root_pose.p, articulation.root_pose.q, articulation.qpos), full=True)
+        else:
+            model.set_base_pose(articulation.root_pose)  # type: ignore
+            model.set_qpos(articulation.qpos, full=True)  # type: ignore
+
+    def fold_qpos(self, qpos):
+        """Simulator qpos (root joints first) -> the planning model's; identity if not folded."""
+        if self.root_folded is None:
+            return np.asarray(qpos, dtype=np.float64)
+        p, q = self._root_pose()
+        return fold_root(p, q, qpos)
+
+    def unfold_qpos(self, qpos, ref_yaw: float | None = None):
+        """The planning model's qpos (1-D or rows) -> simulator qpos; identity if not folded."""
+        if self.root_folded is None:
+            return np.asarray(qpos, dtype=np.float64)
+        p, q = self._root_pose()
+        return unfold_root(p, q, qpos, ref_yaw=ref_yaw)
+
+    def unfold_rates(self, rates):
+        """The planning model's joint rates/accelerations -> the simulator's root frame.
+
+        Unused in production since ``plan_qpos`` unfolds the knots before TOPP; kept
+        (with its test) as the helper for anyone who time-parameterises a folded path
+        themselves.
+        """
+        if self.root_folded is None:
+            return np.asarray(rates, dtype=np.float64)
+        _, q = self._root_pose()
+        return unfold_root_rates(q, rates)
+
+    def update_from_simulation(self, *, update_attached_object: bool = True) -> None:
+        """mplib's sync, with the planned mobile base kept folded (K53).
+
+        Articulations: base pose + qpos from the simulator — through `_place`, so the
+        planned one stays at the identity base with its root pose in the root joints.
+        Attached bodies: mplib's `attached_body.pose = link.inv() * entity.pose`,
+        which against the folded articulation is the true link->object transform.
+        Free actors: overwritten at their simulator pose. Same contract and same
+        errors as `SapienPlanningWorld.update_from_simulation`.
+        """
+        for articulation in self._sim_scene.get_all_articulations():
+            if art := self.get_articulation(convert_object_name(articulation)):
+                self._place(art, articulation)
+            else:
+                raise RuntimeError(
+                    f"Articulation {articulation.name} not found in PlanningWorld! "
+                    "The scene might have changed since last update."
+                )
+
+        for entity in self._sim_scene.get_all_actors():
+            object_name = convert_object_name(entity)
+            if attached_body := self.get_attached_object(object_name):
+                if update_attached_object:
+                    attached_body.pose = (
+                        attached_body.get_attached_link_global_pose().inv() * entity.pose  # type: ignore
+                    )
+                attached_body.update_pose()
+            elif fcl_obj := self.get_object(object_name):
+                self.add_object(
+                    FCLObject(object_name, entity.pose, fcl_obj.shapes, fcl_obj.shape_poses)  # type: ignore
+                )
+            elif (
+                len(entity.find_component_by_type(physx.PhysxRigidBaseComponent).collision_shapes) > 0  # type: ignore
+            ):
+                raise RuntimeError(
+                    f"Entity {entity.name} not found in PlanningWorld! "
+                    "The scene might have changed since last update."
+                )
 
     @staticmethod
     def convert_physx_component(comp: physx.PhysxRigidBaseComponent) -> FCLObject | None:
@@ -357,6 +515,135 @@ class SapienPlanningWorldV2(SapienPlanningWorld):
         )
     
 class SapienPlannerV2(SapienPlanner):
+    """mplib's SapienPlanner with the repo's `plan_screw`/`plan_pose`, and — when the
+    planning world folds the robot's world pose into its root joints (K53,
+    `SapienPlanningWorldV2`) — the two-way translation at the boundary: every qpos a
+    caller passes is the simulator's and is folded before mplib sees it; every plan
+    is unfolded — the path knots back into the root's frame, the yaw on the 2π branch
+    next to the simulator's — **before** TOPP times them (`plan_screw` and
+    `plan_qpos` alike), so the joint limits bind on the root's own axes and
+    `follow_*` in extand.py executes exactly what it did before. `set_base_pose` is a
+    check, not a setting, when folded: the world pose lives in the joints."""
+
+    def set_base_pose(self, pose: mplib.Pose):
+        """Where the base is w.r.t. the world — mplib's, unless the world folds it (K53).
+
+        Folded: the planning articulation's base pose stays the identity; ``pose``
+        must be the simulator's root pose (checked to 1 mm / 1e-3 in the
+        quaternion), and the model is re-placed from the simulator.
+        """
+        world = self.planning_world
+        if getattr(world, "root_folded", None) is None:
+            return super().set_base_pose(pose)
+        p, q = world._root_pose()
+        given = mplib.Pose(pose.p, pose.q) if not isinstance(pose, mplib.Pose) else pose
+        gp, gq = np.asarray(given.p, dtype=np.float64), np.asarray(given.q, dtype=np.float64)
+        if np.linalg.norm(gp - p) > 1e-3 or min(np.linalg.norm(gq - q), np.linalg.norm(gq + q)) > 1e-3:
+            raise ValueError(
+                f"set_base_pose({gp.round(4).tolist()}, {gq.round(4).tolist()}) differs from the "
+                f"simulator's root pose ({p.round(4).tolist()}, {q.round(4).tolist()}); with the base "
+                "pose folded into the root joints (K53) the planner reads it from the simulator"
+            )
+        world._place(self.robot, world._folded[world.root_folded])
+
+    # -- K53: simulator qpos <-> the planning model's ---------------------------------
+
+    def fold_qpos(self, qpos):
+        """Simulator qpos (full or move-group, root joints first) -> the planning model's."""
+        return self.planning_world.fold_qpos(qpos) if hasattr(self.planning_world, "fold_qpos") else np.asarray(qpos, dtype=np.float64)
+
+    def unfold_qpos(self, qpos, ref_yaw: float | None = None):
+        """The planning model's qpos (1-D or rows) -> simulator qpos."""
+        return self.planning_world.unfold_qpos(qpos, ref_yaw=ref_yaw) if hasattr(self.planning_world, "unfold_qpos") else np.asarray(qpos, dtype=np.float64)
+
+    def _root_cols(self) -> list[int] | None:
+        """Move-group columns of the three root joints, or None if not folded / not all in the group."""
+        if getattr(self.planning_world, "root_folded", None) is None:
+            return None
+        mgi = list(self.move_group_joint_indices)
+        if not all(i in mgi for i in (0, 1, 2)):
+            return None
+        return [mgi.index(i) for i in (0, 1, 2)]
+
+    def plan_qpos(
+        self,
+        goal_qposes,
+        current_qpos,
+        *,
+        time_step: float = 0.1,
+        rrt_range: float = 0.1,
+        planning_time: float = 1,
+        fix_joint_limits: bool = True,
+        fixed_joint_indices=None,
+        simplify: bool = True,
+        constraint_function=None,
+        constraint_jacobian=None,
+        constraint_tolerance: float = 1e-3,
+        verbose: bool = False,
+        ref_yaw: float = 0.0,
+    ) -> dict:
+        """mplib 0.2.1's `Planner.plan_qpos` (RRTConnect over the move group, then
+        TOPP), with one insertion: the RRT path is unfolded into the simulator's root
+        frame **before** it is timed (K53) — as `plan_screw` does — so the joint
+        velocity/acceleration limits bind on the root's own x/y axes and the returned
+        `position`/`velocity`/`acceleration` are the simulator's directly. Every
+        argument means what it means in mplib; `qpos` in is the planning model's
+        (folded) — `plan_pose` folds before calling — and out is the simulator's.
+        `ref_yaw` pins the unfolded yaw branch (see `root_frame.unfold_root`).
+        """
+        from mplib.planning.ompl import FixedJoint
+
+        if fixed_joint_indices is None:
+            fixed_joint_indices = []
+        if fix_joint_limits:
+            current_qpos = np.clip(current_qpos, self.joint_limits[:, 0], self.joint_limits[:, 1])
+        current_qpos = self.pad_move_group_qpos(current_qpos)
+
+        self.robot.set_qpos(current_qpos, True)
+        collisions = self.planning_world.check_collision()
+        if len(collisions) > 0:
+            print("Invalid start state!")
+            for collision in collisions:
+                print(f"{collision.link_name1} and {collision.link_name2} collide!")
+
+        move_joint_idx = self.move_group_joint_indices
+        goal_qpos_ = [goal_qposes[i][move_joint_idx] for i in range(len(goal_qposes))]
+        fixed_joints = set()
+        for joint_idx in fixed_joint_indices:
+            fixed_joints.add(FixedJoint(0, joint_idx, current_qpos[joint_idx]))
+        assert len(current_qpos[move_joint_idx]) == len(goal_qpos_[0])
+        status, path = self.planner.plan(
+            current_qpos[move_joint_idx],
+            goal_qpos_,
+            time=planning_time,
+            range=rrt_range,
+            fixed_joints=fixed_joints,
+            simplify=simplify,
+            constraint_function=constraint_function,  # type: ignore
+            constraint_jacobian=constraint_jacobian,  # type: ignore
+            constraint_tolerance=constraint_tolerance,
+            verbose=verbose,
+        )
+        if status != "Exact solution":
+            return {"status": f"RRTConnect Failed. {status}"}
+        if verbose:
+            ta.setup_logging("INFO")
+        else:
+            ta.setup_logging("WARNING")
+        knots = np.array(path, dtype=np.float64)
+        cols = self._root_cols()
+        if cols is not None:  # K53: the simulator's root frame before timing (as plan_screw)
+            knots[:, cols] = self.planning_world.unfold_qpos(knots[:, cols], ref_yaw=ref_yaw)
+        times, pos, vel, acc, duration = self.TOPP(knots, time_step)
+        return {
+            "status": "Success",
+            "time": times,
+            "position": pos,
+            "velocity": vel,
+            "acceleration": acc,
+            "duration": duration,
+        }
+
     # plan_screw ankor
     def plan_screw(
         self,
@@ -368,6 +655,8 @@ class SapienPlannerV2(SapienPlanner):
         wrt_world: bool = True,
         masked_joints: list = None,
         verbose: bool = False,
+        max_iters: int = 200,
+        goal_tolerance: tuple[float, float] | None = None,
     ) -> dict[str, str | np.ndarray | np.float64]:
         # plan_screw ankor end
         """
@@ -376,14 +665,54 @@ class SapienPlannerV2(SapienPlanner):
 
         Args:
             goal_pose: pose of the goal
-            current_qpos: current joint configuration (either full or move_group joints)
+            current_qpos: current joint configuration — the FULL simulator qpos (all
+                joints, root joints first); the clip against ``joint_limits`` below
+                needs the full length, a move-group-length vector broadcasts wrongly
             qpos_step: size of the random step
             time_step: time step for the discretization
             wrt_world: if True, interpret the target pose with respect to the
                 world frame instead of the base frame
             verbose: if True, will print the log of TOPPRA
+            max_iters: give up after this many Jacobian steps
+                (``screw plan failed: no convergence after N step(s), ...``). One
+                step is 0.1 in joint-space norm; the inherited cup planner's
+                alignment screw ran 377 before it collided (docs/lab-journal.md,
+                2026-08-18), so 200 is a bound on the pathological case, not a
+                budget the good ones approach.
+            goal_tolerance: ``(metres, radians)``. When given, a plan whose forward
+                kinematics ends further than this from ``goal_pose`` is reported as
+                ``screw plan failed: converged X cm / Y deg from the goal ...`` instead
+                of ``Success``. Off by default (``None``): the screw integration is a
+                first-order approximation and can "converge" far from the goal (the
+                burner oracle's hover on seed 3: Success, 12.9 cm off), so callers that
+                execute the whole plan and have a fallback — ``static_manipulation``
+                (then ``plan_pose``) and ``lift_hand`` — pass a tolerance;
+                ``move_base_forward``, which executes only the base part of the plan
+                (``follow_moving_forward`` drives the base and holds the arm) and whose
+                FK endpoint therefore says nothing about what the robot will do, must
+                not. ``rotate_base_z`` is not on either list any more: since K51/D12 it
+                does not plan with a screw at all (``base_yaw.py``).
+
+        Returns:
+            dict with ``status``; on ``Success`` also the TOPP trajectory
+            (``time``, ``position``, ``velocity``, ``acceleration``, ``duration``),
+            ``goal_error=(metres, radians)`` of the plan's last knot against
+            ``goal_pose`` and ``iterations``. Every failure status starts with
+            ``screw plan failed``.
         """
-        current_qpos = self.pad_move_group_qpos(current_qpos.copy())
+        # Into the limits first, as plan_pose does (fix_joint_limits): a start qpos a
+        # hair past a stop — the torso parked on its 0.386 m limit — otherwise fails
+        # check_joint_limit on the very first iteration.
+        current_qpos = np.clip(
+            current_qpos, self.joint_limits[:, 0], self.joint_limits[:, 1]
+        )
+        current_qpos = self.pad_move_group_qpos(current_qpos)
+        # K53: the simulator's qpos into the planning model's frame (the robot's
+        # world pose folded into the root joints); the plan is unfolded again before
+        # TOPP, so the trajectory handed back is in the simulator's root frame as
+        # before. `ref_yaw` pins the unfolded yaw to the simulator's 2π branch.
+        ref_yaw = float(current_qpos[2]) if len(current_qpos) > 2 else 0.0
+        current_qpos = self.fold_qpos(current_qpos)
         self.robot.set_qpos(current_qpos, True)
 
         if wrt_world:
@@ -477,17 +806,64 @@ class SapienPlannerV2(SapienPlanner):
             self.planning_world.set_qpos_all(current_qpos[move_joint_idx])
             collide = self.planning_world.is_state_colliding()
 
+            # Three different failures used to share one message. Name the reason:
+            # the caller's stdout is what the next debugging turn reads, and "screw
+            # plan failed" alone cost a run of MikasaBurner-v0 a whole iteration
+            # (docs/lab-journal.md, 2026-08-17). Status still starts with
+            # "screw plan failed" so every `!= "Success"` check upstream is unchanged.
             if np.linalg.norm(delta_twist) < 1e-4 or collide or not within_joint_limit:
-                return {"status": "screw plan failed"}
+                if collide:
+                    why = "collision"
+                    try:
+                        pairs = self.planning_world.check_collision()
+                        names = sorted({f"{c.link_name1}<->{c.link_name2}" for c in pairs})
+                        if names:
+                            why += " " + ", ".join(names[:4])
+                    except Exception:  # pragma: no cover - diagnostic only
+                        pass
+                elif not within_joint_limit:
+                    over = [
+                        i for i, q in enumerate(current_qpos)
+                        if q < self.joint_limits[i][0] - 1e-3 or q > self.joint_limits[i][1] + 1e-3
+                    ]
+                    why = f"joint limit at index {over}"
+                else:
+                    why = "twist stalled (goal not reachable along the screw)"
+                return {
+                    "status": f"screw plan failed: {why} after {len(path)} step(s), "
+                              f"{np.linalg.norm(omega):.3f} of the twist left"
+                }
 
             path.append(np.copy(current_qpos[move_joint_idx]))
+            iterations = len(path) - 1
 
             if flag:
+                # The twist is integrated to first order in a frame fixed at the
+                # start, so "no twist left" is not "at the goal": say how far off
+                # the plan's last knot really is (FK, both poses in the base frame),
+                # and refuse it when the caller asked for a tolerance.
+                self.pinocchio_model.compute_forward_kinematics(current_qpos)
+                ee_pose = self.pinocchio_model.get_link_pose(ee_index)
+                goal_error = pose_error(goal_pose.p, goal_pose.q, ee_pose.p, ee_pose.q)
+                if goal_tolerance is not None and (
+                    goal_error[0] > goal_tolerance[0] or goal_error[1] > goal_tolerance[1]
+                ):
+                    return {
+                        "status": f"screw plan failed: converged {goal_error[0] * 100:.1f} cm / "
+                                  f"{np.degrees(goal_error[1]):.1f} deg from the goal after "
+                                  f"{iterations} step(s)",
+                        "goal_error": goal_error,
+                        "iterations": iterations,
+                    }
                 if verbose:
                     ta.setup_logging("INFO")
                 else:
                     ta.setup_logging("WARNING")
-                times, pos, vel, acc, duration = self.TOPP(np.vstack(path), time_step)
+                knots = np.vstack(path)
+                cols = self._root_cols()
+                if cols is not None:  # K53: back into the simulator's root frame before timing
+                    knots[:, cols] = self.planning_world.unfold_qpos(knots[:, cols], ref_yaw=ref_yaw)
+                times, pos, vel, acc, duration = self.TOPP(knots, time_step)
                 return {
                     "status": "Success",
                     "time": times,
@@ -495,6 +871,14 @@ class SapienPlannerV2(SapienPlanner):
                     "velocity": vel,
                     "acceleration": acc,
                     "duration": duration,
+                    "goal_error": goal_error,
+                    "iterations": iterations,
+                }
+
+            if iterations >= max_iters:
+                return {
+                    "status": f"screw plan failed: no convergence after {iterations} step(s), "
+                              f"{np.linalg.norm(omega):.3f} of the twist left"
                 }
 
 
@@ -522,7 +906,9 @@ class SapienPlannerV2(SapienPlanner):
 
         Args:
             goal_pose: pose of the goal
-            current_qpos: current joint configuration (either full or move_group joints)
+            current_qpos: current joint configuration — the FULL simulator qpos (all
+                joints, root joints first); the clip against ``joint_limits`` needs
+                the full length
             mask: if the value at a given index is True, the joint is *not* used in the
                 IK
             time_step: time step for TOPPRA (time parameterization of path)
@@ -542,6 +928,10 @@ class SapienPlannerV2(SapienPlanner):
                 current_qpos, self.joint_limits[:, 0], self.joint_limits[:, 1]
             )
         current_qpos = self.pad_move_group_qpos(current_qpos)
+        # K53: into the planning model's frame (see plan_screw); `plan_qpos` unfolds
+        # the RRT path before timing it.
+        ref_yaw = float(current_qpos[2]) if len(current_qpos) > 2 else 0.0
+        current_qpos = self.fold_qpos(current_qpos)
 
         if wrt_world:
             goal_pose = self._transform_goal_to_wrt_base(goal_pose)
@@ -571,4 +961,5 @@ class SapienPlannerV2(SapienPlanner):
             constraint_jacobian=constraint_jacobian,
             constraint_tolerance=constraint_tolerance,
             verbose=verbose,
+            ref_yaw=ref_yaw,
         )
