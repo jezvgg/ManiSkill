@@ -799,30 +799,58 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # still between the jaws (partial open), so the close always catches it.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 8: regrasp")
-    # lower the torso back (the plates around the cup's middle - also fixes
-    # the previous hang from a rim-level grip) and close; if it misses,
-    # re-align with the short two-step arm motion to the cup's LIVE position
-    ramp_torso(TORSO_GRASP, steps=100)
+    # First use the geometry already established at release: the TCP is
+    # beside the cup and the jaws are partially open. Close in place, then
+    # lift vertically off the tray as a real attachment test. This avoids
+    # accepting a contact-only grasp that fails when the torso later rises.
     got8 = False
-    for _a in range(3):
-        planner.close_gripper()
-        planner.planner.update_from_simulation()
-        if cup_held():
-            got8 = True
-            break
-        planner.open_gripper()
-        planner.planner.update_from_simulation()
-        cc8 = unwenv.cup.pose.p[0].cpu().numpy()
+    lifted_from_tray = False
+    cup_z_before_regrasp = float(unwenv.cup.pose.p[0][2])
+    planner.close_gripper()
+    planner.planner.update_from_simulation()
+    if cup_held():
+        tcp8 = agent.tcp.pose.p[0].cpu().numpy()
         q8 = agent.tcp.pose.q[0].cpu().numpy()
-        fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
-        int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
-        r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
-                            n_init_qpos=100, disable_lift_joint=False)
+        lift8 = sapien.Pose(p=tcp8 + np.array([0.0, 0.0, 0.15]), q=q8)
+        r8 = env.log_motion(
+            "Stage 8 lift test", planner.static_manipulation, lift8,
+            n_init_qpos=100, disable_lift_joint=False,
+        )
         planner.planner.update_from_simulation()
-        r2 = -1 if r1 == -1 else env.log_motion(
-            "Stage 8 align", planner.static_manipulation, fin8,
-            n_init_qpos=100, disable_lift_joint=False)
-        planner.planner.update_from_simulation()
+        lifted_from_tray = (
+            r8 != -1
+            and float(unwenv.cup.pose.p[0][2]) >= cup_z_before_regrasp + 0.05
+            and tcp_cup_gap() <= 0.12
+        )
+        got8 = lifted_from_tray
+        if not got8:
+            planner.open_gripper()
+            planner.planner.update_from_simulation()
+
+    if not got8:
+        # If the in-place lift is not reachable, lower the torso and solve a
+        # measured front grasp. The lift gate above still rejects tray contact
+        # that merely reports is_grasping while the cup remains supported.
+        ramp_torso(TORSO_GRASP, steps=100)
+        for _a in range(3):
+            planner.close_gripper()
+            planner.planner.update_from_simulation()
+            if cup_held():
+                got8 = True
+                break
+            planner.open_gripper()
+            planner.planner.update_from_simulation()
+            cc8 = unwenv.cup.pose.p[0].cpu().numpy()
+            q8 = agent.tcp.pose.q[0].cpu().numpy()
+            fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
+            int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
+            r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
+                                n_init_qpos=100, disable_lift_joint=False)
+            planner.planner.update_from_simulation()
+            r2 = -1 if r1 == -1 else env.log_motion(
+                "Stage 8 align", planner.static_manipulation, fin8,
+                n_init_qpos=100, disable_lift_joint=False)
+            planner.planner.update_from_simulation()
     if not got8:
         print("Regrasp failed; aborting")
         env.log_event("error", "Regrasp failed")
