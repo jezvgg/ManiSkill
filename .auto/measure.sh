@@ -8,7 +8,7 @@ find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 ssh -o BatchMode=yes -o ConnectTimeout=15 gangway 'rm -rf ~/gw-runs/src/logs' >/dev/null 2>&1 || true
 
 SCRIPT=$(find "$(git rev-parse --show-toplevel)/skills" -name remote_analyze.sh | head -1)
-NO_VIDEO=1 bash "$SCRIPT" myrobocasa_takeitback_planner 50 25
+NO_VIDEO=1 bash "$SCRIPT" myrobocasa_takeitback_planner 50 10
 
 python3 - <<'PY'
 import json
