@@ -451,22 +451,31 @@ def planning(env, seed, debug=False, vis=None, info=False):
         )
 
     def l_drive(aim_xy, tol=0.04):
-        """L-shaped base drive via the screw planner (the closed-loop velocity
-        segment steers wrong at the east heading - its map calibration moves
-        the base away and it stalls: verified 'no progress (best 0.18, now
-        0.20)' on the stage-5 back-up). Axis-aligned: the y-drive first
-        (north/south), then the x-drive (east/west)."""
-        b = agent.base_link.pose.p[0].cpu().numpy()
+        """Move a held cup with a fixed-arm screw path, axis by axis.
+
+        The old velocity correction repeatedly changed direction because the
+        base response map is nearly singular at some headings. A screw target
+        that preserves the current TCP/base transform gives the payload one
+        continuous geometric path and reaches the requested base pose exactly.
+        A tiny y detour breaks mplib's pure-x degeneracy, then a final y leg
+        restores the requested pose.
+        """
         aim = np.asarray(aim_xy, dtype=float)
-        if abs(aim[1] - b[1]) > 0.03:
-            if drive_base_to_position(env, planner,
-                                      np.array([b[0], aim[1], 0.0])) != 0:
+        base = agent.base_link.pose.p[0].cpu().numpy()
+        targets = [
+            np.array([base[0], aim[1] + 0.05, 0.0]),
+            np.array([aim[0], aim[1] + 0.05, 0.0]),
+            np.array([aim[0], aim[1], 0.0]),
+        ]
+        for target in targets:
+            current = agent.base_link.pose.p[0].cpu().numpy()
+            if np.linalg.norm(target[:2] - current[:2]) <= tol:
+                continue
+            if _screw_base_translate(planner, target) != 0:
                 return -1
-        if abs(aim[0] - agent.base_link.pose.p[0].cpu().numpy()[0]) > 0.03:
-            if drive_base_to_position(env, planner,
-                                      np.array([aim[0], aim[1], 0.0])) != 0:
-                return -1
-        return 0
+            planner.planner.update_from_simulation()
+        final = agent.base_link.pose.p[0].cpu().numpy()[:2]
+        return 0 if np.linalg.norm(final - aim[:2]) <= max(tol, 0.06) else -1
 
     def lower_torso_until_cup_rests(surface_top_z):
         """Slowly lower the torso (grasped cup descends with the jaws) until
