@@ -539,38 +539,26 @@ def planning(env, seed, debug=False, vis=None, info=False):
     report_stage("0 raise+align")
 
     # ------------------------------------------------------------------ #
-    # STAGE 1: drive sideways (east-west, along the counter) to the cup's x
-    # at the safe south line (y = cup_y - ARM_OFFSET - 0.4), then STAGE 2:
-    # lower the torso to the grasp height and drive to the PRE-GRASP along a
-    # SAFE corridor. The jaws' plates span +-6.45 cm from the gripper, so any
-    # drive that passes closer than ~10 cm to the cup pushes it with a plate
-    # edge (verified: the cup slid 0.2 m). The offset corridor (cup_x + 0.15)
-    # keeps the plates clear during the y-leg and the x-leg.
-    # The screw drive (drive_base_to_position) is used instead of the closed-
-    # loop velocity segment: it converges reliably (~0.15 m, the arm's fine
-    # alignment covers the rest) and keeps the heading fixed.
+    # STAGE 1: move the fixed straight arm along a safe south corridor, then
+    # STAGE 2: park the base from the measured TCP-to-base transform. Keeping
+    # the arm fixed while the base moves makes the eventual grasp pose a
+    # reachable small correction instead of asking IK to repair a drifting
+    # arm configuration at the shoulder limit.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 1: drive to the cup x")
     cup_xy = unwenv.cup.pose.p[0].cpu().numpy()[:2]
     south_line = cup_xy[1] - ARM_OFFSET - 0.40
-    # the base parks WEST of the cup: the pan-85 arm puts the gripper 10 cm
-    # west of the base, so the y-leg must pass WEST of the cup (the plates
-    # bracket it with 2.6-3.1 cm clearance); an east corridor would drive
-    # the plates through the cup (verified: the cup was knocked over).
-    # L-path: drive SOUTH first (away from the counter) to the line, then
-    # EAST/WEST to the cup's x - a direct diagonal let the base cross the
-    # y=-0.95 counter guard on seed 9 (the screw's rotate-retry slides)
+    # Drive SOUTH first (away from the counter), then EAST/WEST along the
+    # corridor. Fixed-arm screw segments preserve the straight-arm geometry.
     _b1 = agent.base_link.pose.p[0].cpu().numpy()
-    # y_guard=False for the south leg: the robot can SPAWN north of the
-    # counter line (y > -0.95) and must be allowed to drive away from the
-    # counter first (verified: seed 9 aborted before moving - the guard fired
-    # on the starting position)
-    res = env.log_motion("Stage 1 drive", drive_base_to_position,
-                         env, planner, np.array([_b1[0], south_line, 0.0]),
-                         y_guard=False)
+    res = env.log_motion(
+        "Stage 1 drive", l_drive, np.array([_b1[0], south_line])
+    )
     if res == 0:
-        res = env.log_motion("Stage 1 drive", drive_base_to_position,
-                             env, planner, np.array([cup_xy[0] - 0.15, south_line, 0.0]))
+        res = env.log_motion(
+            "Stage 1 drive", l_drive,
+            np.array([cup_xy[0] - 0.15, south_line])
+        )
     if res != 0:
         print("Stage 1 drive failed; aborting")
         env.log_event("error", "Stage 1 drive failed")
@@ -601,36 +589,16 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 _acm.set_default_entry(convert_object_name(_act._objs[0]), True)
             except Exception:
                 pass
-    # drive with the arm HIGH (the plates 15+ cm above the cup - they cannot
-    # touch it), lower the torso to the grasp height only AFTER the base is
-    # parked (verified: drives with the plates at cup height pushed the cup
-    # 12 cm)
+    # Keep the arm HIGH while parking the base; the plates cannot touch the
+    # cup. Use the live straight-arm offset, not an idealized arm length.
     cc = unwenv.cup.pose.p[0].cpu().numpy()
-    # the gripper parks 6 cm SOUTH-EAST of the cup: the jaws' plate edges
-    # (2.6 cm deep faces) must stay clear of the cup during the drives
-    # (verified: a y-leg driving the gripper to the cup's own y caught the
-    # cup with the plate edges and knocked it over - seed 3 run).
-    pre = np.array([cc[0] + 0.03, cc[1] - ARM_OFFSET + 0.03, 0.0])
-    res = env.log_motion("Stage 2 pre-grasp", drive_base_to_position,
-                         env, planner, pre)
+    arm_xy = (
+        agent.tcp.pose.p[0].cpu().numpy()[:2]
+        - agent.base_link.pose.p[0].cpu().numpy()[:2]
+    )
+    pre = np.array([cc[0] - arm_xy[0], cc[1] - arm_xy[1]])
+    res = env.log_motion("Stage 2 pre-grasp", l_drive, pre)
     planner.planner.update_from_simulation()
-    # correction loop: the screw drive lands ~15 cm off, but the arm's align
-    # (pan-85, near the +-92 deg joint limit) can only cover ~8-10 cm, so
-    # re-aim the base until the GRIPPER is within ~5 cm of the cup
-    for _c in range(3):
-        _g = agent.tcp.pose.p[0].cpu().numpy()[:2]
-        _cc2 = unwenv.cup.pose.p[0].cpu().numpy()[:2]
-        if float(np.linalg.norm(_g - _cc2)) <= 0.05:
-            break
-        _b = agent.base_link.pose.p[0].cpu().numpy()[:2]
-        # aim the gripper 6 cm west-south of the cup: the drives' overshoot
-        # keeps the plates clear of the cup (a 3 cm aim let the plates push
-        # the cup ~12 cm)
-        _aim2 = np.array([_b[0] + (_cc2[0] - 0.06 - _g[0]),
-                          _b[1] + (_cc2[1] - 0.06 - _g[1]), 0.0])
-        env.log_motion("Stage 2 correction", drive_base_to_position,
-                       env, planner, _aim2)
-        planner.planner.update_from_simulation()
     ramp_torso(TORSO_GRASP, steps=120)
     report_stage("2 pre-grasp")
 
