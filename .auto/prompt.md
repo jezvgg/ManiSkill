@@ -57,3 +57,5 @@ The current planner is over-constrained by a fixed straight-arm configuration, p
 - Slow torso lowering and stationary release.
 
 These mechanisms are useful diagnostics, but the benchmark evidence points to a geometric redesign rather than more attempts at the same pose. Update this section after each meaningful experiment with the result and the general lesson, including discarded ideas.
+
+Latest experiments: 10 workers produced a complete 36/50 baseline. A 65-degree pan redesign collapsed to 12/50 and was discarded. A fixed-arm screw transport route reached 42/50; fixed-arm screw staging plus live pre-grasp parking reached 45/50; live front-facing initial fallback reached 38/50 when tested alone. Closing from the release pose and validating an immediate vertical lift reached 48/50, then skipping the redundant Stage 9 lift check after that verified lift reached 50/50. Run an independent 50/10 confirmation before finalizing.

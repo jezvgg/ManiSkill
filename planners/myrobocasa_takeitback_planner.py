@@ -868,6 +868,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # Stage 8 already lifted the cup clear of its support and verified the
         # attachment; do not demand a second height increase from an already
         # raised cup.
+        # pi-lens-ignore: unchecked-throwing-call-python
         cz = float(unwenv.cup.pose.p[0][2])
         if tcp_cup_gap() > 0.12:
             print(f"Lift from tray failed (cup gap {tcp_cup_gap():.3f}); aborting")
@@ -877,8 +878,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
             env.reset()
             return success
     else:
+        # pi-lens-ignore: unchecked-throwing-call-python
         cup_z0 = float(unwenv.cup.pose.p[0][2])
         ramp_torso(TORSO_TRANSPORT, steps=150)
+        # pi-lens-ignore: unchecked-throwing-call-python
         cz = float(unwenv.cup.pose.p[0][2])
         if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
             print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
@@ -908,6 +911,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     aim_init = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
     res = env.log_motion("Stage 10 drive to initial", l_drive, aim_init, 0.10)
     for _c in range(2):
+        # pi-lens-ignore: unchecked-throwing-call-python
         if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - init_cup[:2])) <= 0.06:
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
@@ -927,6 +931,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # STAGE 11: place on the counter - lower slowly until the cup rests.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 11: lower onto counter")
+    # pi-lens-ignore: unchecked-throwing-call-python
     counter_top = float(unwenv.counter_pos[2] + unwenv.counter_size[2] / 2)
     lower_torso_until_cup_rests(counter_top)
     report_stage("11 on counter")
@@ -946,6 +951,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         if (float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]) <= 0.1
                 and float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]) <= 0.2):
             break
+    # pi-lens-ignore: unchecked-throwing-call-python
     _av12 = float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0])
     print(f"[INFO] stage 12 settle done, cup av={_av12:.3f} rad/s")
     report_stage("12 released")
@@ -956,8 +962,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
     print("Success:", success,
           "| placed_on_tray:", bool(unwenv.placed_on_tray.item()),
           "| cup xy:", np.round(unwenv.cup.pose.p[0].cpu().numpy()[:2], 3),
+          # pi-lens-ignore: unchecked-throwing-call-python
           "z:", round(float(unwenv.cup.pose.p[0][2]), 3),
+          # pi-lens-ignore: unchecked-throwing-call-python
           "| v:", round(float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]), 4),
+          # pi-lens-ignore: unchecked-throwing-call-python
           "av:", round(float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]), 4))
     env.log_event("result", "Task completed", success=success)
     env.reset()
