@@ -655,6 +655,48 @@ def planning(env, seed, debug=False, vis=None, info=False):
             planner.open_gripper()
             planner.planner.update_from_simulation()
     if not got:
+        # The straight-arm pose is a useful transport posture, but it is a
+        # poor final grasp posture for some cup positions. Rebuild a
+        # horizontal, front-facing grasp from the live TCP-to-cup direction
+        # instead of retrying the same near-limit orientation.
+        mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
+        if mesh is not None:
+            obb = mesh.bounding_box_oriented
+            cc = obb.center_mass.copy()
+            tcp = agent.tcp.pose.p[0].cpu().numpy()
+            ed = cc - tcp
+            ed[2] = 0.0
+            if np.linalg.norm(ed) < 1e-6:
+                ed = np.array([0.0, 1.0, 0.0])
+            ed /= np.linalg.norm(ed)
+            closing = np.cross(np.array([0.0, 0.0, 1.0]), ed)
+            if np.linalg.norm(closing) < 1e-6:
+                closing = np.array([0.0, 1.0, 0.0])
+            closing /= np.linalg.norm(closing)
+            for raise_z in (0.02, 0.06, 0.04):
+                grasp_pose, reach_pose = _grasp_pose(
+                    agent, obb, cc, ed, closing,
+                    raise_z=raise_z, back_off=0.06, force_front=True,
+                )
+                r1 = env.log_motion(
+                    "Stage 3 alternate approach", planner.static_manipulation,
+                    reach_pose, n_init_qpos=100, disable_lift_joint=False,
+                )
+                planner.planner.update_from_simulation()
+                r2 = -1 if r1 == -1 else env.log_motion(
+                    "Stage 3 alternate grasp", planner.static_manipulation,
+                    grasp_pose, n_init_qpos=100, disable_lift_joint=False,
+                )
+                planner.planner.update_from_simulation()
+                if r2 != -1 and _tcp_at(agent, grasp_pose, tol=0.05):
+                    planner.close_gripper()
+                    planner.planner.update_from_simulation()
+                    if cup_held():
+                        got = True
+                        break
+                    planner.open_gripper()
+                    planner.planner.update_from_simulation()
+    if not got:
         print("Grasp failed after retries; aborting")
         env.log_event("error", "Grasp failed")
         success = bool(unwenv.evaluate()["success"].item())
