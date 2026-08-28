@@ -187,6 +187,8 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
                       target_closing, unwenv, raises=GRASP_RAISES, back_off=0.1,
                       lift_over=0.0, use_fallback=True, allow_tray=False,
                       force_front=False):
+    from mplib.sapien_utils.conversion import convert_object_name
+
     if allow_tray:
         # the tray regrasp: the arm reaches OVER the tray to the cup; without
         # this the mplib IK rejects every candidate as a tray collision
@@ -195,8 +197,8 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
         try:
             acm = planner.planner.planning_world.get_allowed_collision_matrix()
             acm.set_default_entry(convert_object_name(unwenv.tray._objs[0]), True)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[INFO] could not allow tray collision: {type(exc).__name__}")
     """Reach the pre-grasp pose, execute the grasp and close the gripper.
     The RRT planner is stochastic, so retry with flipped approach/closing and
     repeated attempts. The cup is re-measured AFTER every reach: the executed
@@ -207,8 +209,6 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
     gripper orientation (the OBB long-side axis of the round cup is
     numerically unstable and can demand an unreachable orientation). Returns
     the executed grasp pose, or None if all attempts failed."""
-    from mplib.sapien_utils.conversion import convert_object_name
-
     for attempt in range(6):
         ed = ee_direction if attempt % 2 == 0 else -ee_direction
         tc = target_closing if attempt < 2 else -target_closing
@@ -587,8 +587,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
                                     "tray")):
             try:
                 _acm.set_default_entry(convert_object_name(_act._objs[0]), True)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[INFO] could not allow {_nm} collision: {type(exc).__name__}")
     # Keep the arm HIGH while parking the base; the plates cannot touch the
     # cup. Use the live straight-arm offset, not an idealized arm length.
     cc = unwenv.cup.pose.p[0].cpu().numpy()
