@@ -864,16 +864,29 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # STAGE 9: lift from the tray - raise the torso, verify the cup rose.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 9: lift from tray")
-    cup_z0 = float(unwenv.cup.pose.p[0][2])
-    ramp_torso(TORSO_TRANSPORT, steps=150)
-    cz = float(unwenv.cup.pose.p[0][2])
-    if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
-        print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
-        env.log_event("error", "Lift from tray failed")
-        success = bool(unwenv.evaluate()["success"].item())
-        env.log_event("result", "Task aborted", success=success)
-        env.reset()
-        return success
+    if lifted_from_tray:
+        # Stage 8 already lifted the cup clear of its support and verified the
+        # attachment; do not demand a second height increase from an already
+        # raised cup.
+        cz = float(unwenv.cup.pose.p[0][2])
+        if tcp_cup_gap() > 0.12:
+            print(f"Lift from tray failed (cup gap {tcp_cup_gap():.3f}); aborting")
+            env.log_event("error", "Lift from tray failed")
+            success = bool(unwenv.evaluate()["success"].item())
+            env.log_event("result", "Task aborted", success=success)
+            env.reset()
+            return success
+    else:
+        cup_z0 = float(unwenv.cup.pose.p[0][2])
+        ramp_torso(TORSO_TRANSPORT, steps=150)
+        cz = float(unwenv.cup.pose.p[0][2])
+        if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
+            print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
+            env.log_event("error", "Lift from tray failed")
+            success = bool(unwenv.evaluate()["success"].item())
+            env.log_event("result", "Task aborted", success=success)
+            env.reset()
+            return success
     report_stage("9 lifted from tray")
 
     # ------------------------------------------------------------------ #
