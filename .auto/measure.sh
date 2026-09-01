@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SEED_COUNT=${SEED_COUNT:-50}
+WORKERS=${WORKERS:-10}
+export SEED_COUNT WORKERS
+
 mkdir -p logs
 find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 # remote_analyze seeds run dirs from a persistent code cache; remove only stale
@@ -8,14 +12,15 @@ find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 ssh -o BatchMode=yes -o ConnectTimeout=15 gangway 'rm -rf ~/gw-runs/src/logs' >/dev/null 2>&1 || true
 
 SCRIPT=$(find "$(git rev-parse --show-toplevel)/skills" -name remote_analyze.sh | head -1)
-NO_VIDEO=1 bash "$SCRIPT" myrobocasa_takeitback_planner 50 10
+NO_VIDEO=1 bash "$SCRIPT" myrobocasa_takeitback_planner "$SEED_COUNT" "$WORKERS"
 
 python3 - <<'PY'
 import json
+import os
 import re
 from pathlib import Path
 
-expected = set(range(1, 51))
+expected = set(range(1, int(os.environ["SEED_COUNT"]) + 1))
 runs = {}
 for path in Path("logs").glob("takeitback_seed*_*/takeitback_seed*_events.jsonl"):
     match = re.search(r"takeitback_seed(\d+)_", path.name)
@@ -49,11 +54,11 @@ for seed, event_path in runs.items():
         if f"[STAGE] {stage} " in text:
             stage_counts[stage] += 1
 
-print(f"SUMMARY runs={len(runs)} completed={len(completed)} successes={successes} missing={50-len(completed)} errors={error_events}")
+print(f"SUMMARY runs={len(runs)} completed={len(completed)} successes={successes} missing={len(expected - completed)} errors={error_events}")
 print(f"METRIC successes={successes}")
 print(f"METRIC completed={len(completed)}")
 print(f"METRIC stage3={stage_counts[3]}")
 print(f"METRIC stage5={stage_counts[5]}")
 print(f"METRIC stage12={stage_counts[12]}")
-print(f"METRIC missing={50-len(completed)}")
+print(f"METRIC missing={len(expected - completed)}")
 PY
