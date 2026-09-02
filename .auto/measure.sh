@@ -3,7 +3,9 @@ set -euo pipefail
 
 SEED_COUNT=${SEED_COUNT:-50}
 WORKERS=${WORKERS:-10}
-export SEED_COUNT WORKERS
+PLANNER_NAME=${PLANNER_NAME:-myrobocasa_takeitback_planner}
+LOG_PREFIX=${LOG_PREFIX:-takeitback}
+export SEED_COUNT WORKERS PLANNER_NAME LOG_PREFIX
 
 mkdir -p logs
 find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
@@ -12,7 +14,7 @@ find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 ssh -o BatchMode=yes -o ConnectTimeout=15 gangway 'rm -rf ~/gw-runs/src/logs' >/dev/null 2>&1 || true
 
 SCRIPT=$(find "$(git rev-parse --show-toplevel)/skills" -name remote_analyze.sh | head -1)
-NO_VIDEO=1 bash "$SCRIPT" myrobocasa_takeitback_planner "$SEED_COUNT" "$WORKERS"
+NO_VIDEO=1 bash "$SCRIPT" "$PLANNER_NAME" "$SEED_COUNT" "$WORKERS"
 
 python3 - <<'PY'
 import json
@@ -22,8 +24,8 @@ from pathlib import Path
 
 expected = set(range(1, int(os.environ["SEED_COUNT"]) + 1))
 runs = {}
-for path in Path("logs").glob("takeitback_seed*_*/takeitback_seed*_events.jsonl"):
-    match = re.search(r"takeitback_seed(\d+)_", path.name)
+for path in Path("logs").glob(f'{os.environ["LOG_PREFIX"]}_seed*_*/{os.environ["LOG_PREFIX"]}_seed*_events.jsonl'):
+    match = re.search(rf'{re.escape(os.environ["LOG_PREFIX"])}_seed(\d+)_', path.name)
     if not match:
         continue
     seed = int(match.group(1))
@@ -57,8 +59,9 @@ for seed, event_path in runs.items():
 print(f"SUMMARY runs={len(runs)} completed={len(completed)} successes={successes} missing={len(expected - completed)} errors={error_events}")
 print(f"METRIC successes={successes}")
 print(f"METRIC completed={len(completed)}")
-print(f"METRIC stage3={stage_counts[3]}")
-print(f"METRIC stage5={stage_counts[5]}")
-print(f"METRIC stage12={stage_counts[12]}")
+if os.environ["LOG_PREFIX"] == "takeitback":
+    print(f"METRIC stage3={stage_counts[3]}")
+    print(f"METRIC stage5={stage_counts[5]}")
+    print(f"METRIC stage12={stage_counts[12]}")
 print(f"METRIC missing={len(expected - completed)}")
 PY

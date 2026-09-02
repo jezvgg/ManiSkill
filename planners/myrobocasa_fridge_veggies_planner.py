@@ -3,6 +3,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
@@ -219,6 +220,11 @@ def parse_args():
         default=10,
         help="Write trajectory rows every N steps (default: 10)",
     )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable mp4 recording for batch runs",
+    )
     return parser.parse_args()
 
 
@@ -310,8 +316,8 @@ def _drive_base(
             he = float(np.arctan2(np.cross(xa, dt)[2], np.dot(xa, dt)))
             if abs(he) < np.deg2rad(align_deg):
                 break
-            ba = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
-            env.step(np.hstack([arm_action, 1, body_action, ba]))
+            base_action = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
+            env.step(np.hstack([arm_action, 1, body_action, base_action]))
         planner.planner.update_from_simulation()
 
     cur = agent.base_link.pose.p[0].cpu().numpy().copy()
@@ -380,8 +386,8 @@ def _yaw_base_to(env, planner, target_pos, max_rot=500, align_deg=3.0):
         he = float(np.arctan2(np.cross(xa, delta / dist)[2], np.dot(xa, delta / dist)))
         if abs(he) < np.deg2rad(align_deg):
             break
-        ba = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
-        env.step(np.hstack([arm_action, 1, body_action, ba]))
+        base_action = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
+        env.step(np.hstack([arm_action, 1, body_action, base_action]))
     planner.planner.update_from_simulation()
 
 
@@ -866,7 +872,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     unwenv: MyRoboCasaFridgeVeggies = env.unwrapped
     _install_render_cameras(env)  # BEFORE reset: camera configs are read at reconfigure
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
-    agent: Fetch = unwenv.agent  # must be captured AFTER the reconfigure reset
+    # ManiSkill resolves agent/controller types dynamically at runtime.
+    agent: Any = unwenv.agent  # must be captured AFTER the reconfigure reset
 
     # --- identify the target from the fridge picture -----------------------
     # The scene shows the pictured vegetable's own photo texture; the planner
@@ -895,7 +902,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     q[arm_idx] = rest_qpos[arm_idx]
     agent.robot.set_qpos(q)
 
-    planner = FetchMotionPlanningSapienSolver(
+    planner: Any = FetchMotionPlanningSapienSolver(
         env,
         base_pose=agent.robot.pose,
         vis=vis,
@@ -1031,7 +1038,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     if grasp_pose is None:
         print("Grasping failed entirely.")
-        success = bool(unwenv.evaluate()["success"].item())
+        success = bool(unwenv.evaluate()["success"].item())  # pyright: ignore[reportAttributeAccessIssue]
         env.log_event("result", "Task failed at grasp", success=success)
         env.reset()
         return success
@@ -1377,7 +1384,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     print("Task completed. Closing env...")
     ev = unwenv.evaluate()
-    success = bool(ev["success"].item())
+    success = bool(ev["success"].item())  # pyright: ignore[reportAttributeAccessIssue]
     print("Success:", success,
           {k: v for k, v in ev.items() if k.startswith("dbg")})
     print("Success:", success)
@@ -1422,16 +1429,18 @@ if __name__ == "__main__":
     # Video-only recording: frames stream straight into ffmpeg, so RAM stays at
     # a single frame instead of RecordEpisode's whole-episode frame buffer
     # (~12 GB at the 2048x2048 render resolution).
-    env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
+    if not args.no_video:
+        env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
     env = PlannerLogger(
         env,
-        log_dir=run_dir,
+        log_dir=str(run_dir),
         name=f"fridgeveggies_seed{SEED}",
         log_freq=args.log_freq,
-        run_dir=run_dir,
+        run_dir=str(run_dir),
     )
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):
         planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
-    print(f"[INFO] Video recording saved in '{run_dir}/'")
+    if not args.no_video:
+        print(f"[INFO] Video recording saved in '{run_dir}/'")
