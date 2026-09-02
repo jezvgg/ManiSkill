@@ -1350,6 +1350,18 @@ def planning(env, seed, debug=False, vis=None, info=False):
             planner.planner.update_from_simulation()
             if res == -1:
                 break
+        veg_z_now = float(target_veg.pose.p[0].cpu().numpy()[2])
+        if veg_z_now > release_z + 0.02:
+            remaining = veg_z_now - release_z - 0.01
+            print(f"[INFO] release descend fallback: torso drop {remaining:.3f} m")
+            lower_torso_smooth(
+                env,
+                planner,
+                target_drop=min(remaining, 0.16),
+                total_steps=60,
+                arm_action=arm_action,
+                gripper_action=planner.gripper_state,
+            )
         planner.planner.update_from_simulation()
         arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
         body_action = agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
