@@ -1057,8 +1057,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
             tcp_pos = agent.tcp.pose.p[0].cpu().numpy()
             veg_now = target_veg.pose.p[0].cpu().numpy()
-            # pi-lens-ignore: unchecked-throwing-call-python
-            grasped = bool(agent.is_grasping(target_veg)) or (
+            # Require both physical contact and a measured lift. Contact
+            # alone can be a finger/counter collision that falsely licenses
+            # transport with an empty gripper.
+            grasped = bool(agent.is_grasping(target_veg)) and (
                 np.linalg.norm(tcp_pos - veg_now) < 0.08
                 and (veg_now[2] - veg_z0) > 0.03
             )
