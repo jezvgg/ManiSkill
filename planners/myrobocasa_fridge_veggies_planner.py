@@ -249,7 +249,7 @@ def _detach_object(planner):
     planner.planner.detach_object()
 
 
-def _top_down_grasp_pose(agent, obj_center, closing, raise_z):
+def _top_down_grasp_pose(agent, obj_center, closing, raise_z, pre_clear=0.14):
     """Top-down grasp pose: the gripper approaches straight down (-z world)
     and the fingers close along the horizontal `closing` axis. The grasp
     center is the vegetable's xy at its center height, raised so the fingers
@@ -273,7 +273,7 @@ def _top_down_grasp_pose(agent, obj_center, closing, raise_z):
     # (~0.60 m at z+0.18), and bases at 0.62-0.65 m (yaw drift) could not
     # reach it (seeds 28/34/46/50); 14 cm keeps the over-the-top clearance
     # while staying inside the reachable envelope from those bases.
-    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.14])
+    reach_pose = grasp_pose * sapien.Pose([0, 0, -pre_clear])
     return grasp_pose, reach_pose
 
 
@@ -567,7 +567,7 @@ def _descend_tcp_abs(env, planner, tgt, n_init_qpos=100):
     return 0
 
 
-def _reach_and_grasp(env, planner, agent):
+def _reach_and_grasp(env, planner, agent, pre_clear=0.14):
     """Reach the pre-grasp pose then execute the grasp. ONLY top-down grasps
     are attempted: the gripper approaches straight down (-z) and the fingers
     close along a horizontal world axis (x or y). Straight/side grasps are
@@ -629,7 +629,7 @@ def _reach_and_grasp(env, planner, agent):
         # would push the plates into the counter.
         for raise_z in (0.0, 0.02, 0.04, 0.06):
             grasp_pose, reach_pose = _top_down_grasp_pose(
-                agent, obj_center, tc, raise_z
+                agent, obj_center, tc, raise_z, pre_clear
             )
             res = env.log_motion(
                 "Reach veggie",
@@ -672,7 +672,7 @@ def _reach_and_grasp(env, planner, agent):
                 .numpy()
                 .copy()
             )
-            grasp_pose, _ = _top_down_grasp_pose(agent, obj_center, tc, raise_z)
+            grasp_pose, _ = _top_down_grasp_pose(agent, obj_center, tc, raise_z, pre_clear)
             # fingertip grasp: allow the fingers to touch the target vegetable
             # in the planning world, otherwise the collision-aware IK refuses
             # every pose that reaches a flat vegetable on the counter. The
@@ -994,8 +994,17 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
             print("Reaching + grasping target vegetable")
             env.log_event("phase", "Reaching target vegetable")
-            grasp_pose = _reach_and_grasp(env, planner, agent)
-            planner.planner.update_from_simulation()
+            # Keep proven high clearance first; a lower pre-grasp can recover
+            # poses whose high target is outside the arm's collision-free
+            # envelope without disturbing seeds that already work.
+            grasp_pose = None
+            for pre_clear in (0.14, 0.10):
+                grasp_pose = _reach_and_grasp(
+                    env, planner, agent, pre_clear=pre_clear
+                )
+                planner.planner.update_from_simulation()
+                if grasp_pose is not None:
+                    break
             if grasp_pose is None:
                 continue
 
