@@ -543,13 +543,13 @@ def _descend_tcp_step(env, planner, dz, n_init_qpos=200):
 
 
 def _descend_tcp_abs(env, planner, tgt, n_init_qpos=100):
-    """Base-fixed plan to an ABSOLUTE TCP pose: the grasp descent.
+    """Reach grasp height with a fixed-base plan and a vertical fallback.
 
-    The old free-base "Grasp veggie" static_manipulation let the IK swing the
-    whole robot sideways mid-descent, sweeping the fingers through the
-    vegetable at its height and knocking it away (seeds 30/42/47). Fixing
-    root_x/y/z keeps the approach strictly vertical onto the vegetable.
-    Returns 0 on success, -1 on failure."""
+    If the fixed-base RRT cannot solve the final drop, lower the torso slowly
+    while holding arm/base targets. This keeps the already aligned TCP on a
+    vertical corridor instead of retrying a blocked long plan.
+    """
+    agent = env.unwrapped.agent
     mask = [True, True, True] + [False] * 12
     res = planner.planner.plan_pose(
         tgt, planner.robot.get_qpos().cpu().numpy()[0],
@@ -557,14 +557,30 @@ def _descend_tcp_abs(env, planner, tgt, n_init_qpos=100):
         planning_time=4, rrt_range=0.1, simplify=True, mask=mask,
         fixed_joint_indices=[0, 1, 2], n_init_qpos=n_init_qpos,
     )
-    if not str(res.get("status", "")).startswith("Success"):
-        print(f"[WARN] grasp descend failed: {res.get('status')}")
-        return -1
-    try:
-        planner.follow_path(res)
-    except AssertionError:
-        return -1
-    return 0
+    if str(res.get("status", "")).startswith("Success"):
+        try:
+            planner.follow_path(res)
+            return 0
+        except AssertionError as exc:
+            print(f"[INFO] grasp descend path failed: {exc}")
+
+    current_z = float(agent.tcp.pose.sp.p[2])
+    drop = current_z - float(tgt.p[2])
+    if drop > 0.01:
+        print(f"[INFO] grasp descend fallback: torso drop {drop:.3f} m")
+        arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+        lower_torso_smooth(
+            env,
+            planner,
+            target_drop=min(drop, 0.16),
+            total_steps=50,
+            arm_action=arm_action,
+            gripper_action=planner.gripper_state,
+        )
+        if _tcp_at(agent, tgt, tol=0.06):
+            return 0
+    print(f"[WARN] grasp descend failed: {res.get('status')}")
+    return -1
 
 
 def _reach_and_grasp(env, planner, agent, pre_clear=0.14):
