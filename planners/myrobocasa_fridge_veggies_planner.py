@@ -929,8 +929,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # (beyond the reach) and were dropped.
     stance_dirs = [
         np.array([0.0, -1.0]),
-        np.array([0.64, -0.77]),
-        np.array([-0.64, -0.77]),
+        np.array([0.5, -0.8660254]),
+        np.array([-0.5, -0.8660254]),
     ]
     for sdir in stance_dirs:
         for dist in (0.5, 0.6):
