@@ -947,7 +947,19 @@ def planning(env, seed, debug=False, vis=None, info=False):
             veg_center = target_veg.pose.p[0].cpu().numpy().copy()
             approach_pos = veg_center.copy()
             approach_pos[:2] += sdir * dist
+            counter_front_y = float(
+                unwenv.counter_pos[1] - unwenv.counter_size[1] / 2
+            )
+            approach_pos[1] = min(approach_pos[1], counter_front_y - 0.02)
             approach_pos[2] = 0.0
+            staging_pos = approach_pos.copy()
+            staging_pos[1] = min(staging_pos[1], counter_front_y - 0.35)
+            if np.linalg.norm(
+                agent.base_link.pose.p[0].cpu().numpy()[:2] - staging_pos[:2]
+            ) >= 0.10:
+                print(f"Staging base in open corridor at {np.round(staging_pos, 3)}")
+                _drive_base(env, planner, staging_pos)
+                planner.planner.update_from_simulation()
             print(f"Approaching target: driving base to {np.round(approach_pos, 3)}")
             env.log_event("phase", "Approach target")
             _drive_base(env, planner, approach_pos)
