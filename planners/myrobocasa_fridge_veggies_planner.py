@@ -505,9 +505,17 @@ def _descend_tcp_step(env, planner, dz, n_init_qpos=200):
         physx.PhysxRigidBaseComponent
     )
     pot_name = convert_object_name(pot_comp.entity)
+    target_comp = env.unwrapped.veggies[
+        env.unwrapped._picture_target
+    ]._objs[0].find_component_by_type(physx.PhysxRigidBaseComponent)
+    target_name = convert_object_name(target_comp.entity)
     pot_links = [link.name for link in robot.get_links()]
     for ln in pot_links:
         acm.set_entry(ln, pot_name, True)
+    # The held target is attached in the planning world during transport.
+    # Allow it to enter the pot as well; otherwise the robot-link allowance
+    # below is insufficient and release IK stops above the container floor.
+    acm.set_entry(target_name, pot_name, True)
 
     # move-group order: root_x, root_y, root_z, torso, shoulder_pan,
     # shoulder_lift, upperarm_roll, elbow_flex, forearm_roll, wrist_flex,
@@ -522,6 +530,7 @@ def _descend_tcp_step(env, planner, dz, n_init_qpos=200):
     )
     for ln in pot_links:
         acm.set_entry(ln, pot_name, False)
+    acm.set_entry(target_name, pot_name, False)
     if not str(res.get("status", "")).startswith("Success"):
         print(f"[WARN] descend step failed: {res.get('status')}")
         return -1
