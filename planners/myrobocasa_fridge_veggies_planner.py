@@ -926,6 +926,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         print_env_info=info,
         debug=debug,
     )
+    planner.MAX_REFINE_STEPS = 100
     for i, veg in enumerate(unwenv.veggies):
         env.track_object(veg, f"veg_{i}")
     env.track_object(unwenv.plate, "plate")
