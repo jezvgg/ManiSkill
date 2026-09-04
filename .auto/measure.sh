@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SEED_COUNT=${SEED_COUNT:-50}
+SEED_COUNT=${SEED_COUNT:-100}
 WORKERS=${WORKERS:-10}
-PLANNER_NAME=${PLANNER_NAME:-myrobocasa_takeitback_planner}
-LOG_PREFIX=${LOG_PREFIX:-takeitback}
+PLANNER_NAME=${PLANNER_NAME:-myrobocasa_fridge_veggies_planner}
+LOG_PREFIX=${LOG_PREFIX:-fridgeveggies}
 export SEED_COUNT WORKERS PLANNER_NAME LOG_PREFIX
 
 mkdir -p logs
