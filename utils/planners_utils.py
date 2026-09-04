@@ -621,7 +621,8 @@ def lower_torso_until_rest(env, planner, target_drop, *, chunk=0.02,
 
 
 def _yaw_sweep_with_pass_check(env, planner, bearing, plate_center, *,
-                               rot_cap=0.12, align_deg=6.0, pass_dxy=0.09,
+                               target_obj=None, rot_cap=0.12,
+                               align_deg=6.0, pass_dxy=0.09,
                                max_steps=300):
     """Rotate the base toward `bearing` in small increments, checking the held
     vegetable's horizontal distance to the plate after EVERY increment.
@@ -645,7 +646,11 @@ def _yaw_sweep_with_pass_check(env, planner, bearing, plate_center, *,
         return float(np.arctan2(m[1], m[0]))
 
     def veg_plate_dxy():
-        o = _current_object_pos(env, planner)
+        o = (
+            np.asarray(target_obj.pose.sp.p, dtype=float)
+            if target_obj is not None
+            else _current_object_pos(env, planner)
+        )
         if o is None:
             return None
         return float(np.linalg.norm(np.asarray(plate_center)[:2] - o[:2]))

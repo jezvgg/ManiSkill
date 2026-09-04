@@ -1153,6 +1153,39 @@ def planning(env, seed, debug=False, vis=None, info=False):
     veg_now = target_veg.pose.p[0].cpu().numpy()
     # pi-lens-ignore: unchecked-throwing-call-python
     dxy = np.linalg.norm(veg_now[:2] - plate_center[:2])
+    if 0.05 <= dxy < 0.35 and veg_now[2] >= 1.0:
+        # If the pot lies on the held payload's current orbit around the base,
+        # yaw alone can finish a stalled transport without moving the arm.
+        base_xy = agent.base_link.pose.p[0].cpu().numpy()[:2]
+        veg_from_base = veg_now[:2] - base_xy
+        pot_from_base = plate_center[:2] - base_xy
+        radius_error = abs(
+            np.linalg.norm(veg_from_base) - np.linalg.norm(pot_from_base)
+        )
+        if radius_error <= 0.04:
+            heading = np.arctan2(
+                agent.base_link.pose.sp.to_transformation_matrix()[1, 0],
+                agent.base_link.pose.sp.to_transformation_matrix()[0, 0],
+            )
+            local_angle = np.arctan2(veg_from_base[1], veg_from_base[0]) - heading
+            goal_heading = (
+                np.arctan2(pot_from_base[1], pot_from_base[0]) - local_angle
+            )
+            from utils.planners_utils import _yaw_sweep_with_pass_check
+
+            _yaw_sweep_with_pass_check(
+                env,
+                planner,
+                np.array([np.cos(goal_heading), np.sin(goal_heading)]),
+                plate_center,
+                target_obj=target_veg,
+                rot_cap=0.06,
+                pass_dxy=0.04,
+            )
+            planner.planner.update_from_simulation()
+
+    veg_now = target_veg.pose.p[0].cpu().numpy()
+    dxy = np.linalg.norm(veg_now[:2] - plate_center[:2])
     if 0.05 <= dxy < 0.60 and veg_now[2] >= 1.0:
         # arm alignment: step the TCP toward the plate center in small
         # verified motions (a single long arm motion at the workspace edge
@@ -1313,7 +1346,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
             _yaw_sweep_with_pass_check(
                 env, planner,
                 np.asarray(plate_center)[:2] - base_xy,
-                target_veg.pose.p[0].cpu().numpy(),
+                plate_center,
+                target_obj=target_veg,
                 rot_cap=0.10, pass_dxy=0.04,
             )
             planner.planner.update_from_simulation()
