@@ -906,6 +906,17 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # reads the scene state directly (the picture actor shown this episode).
     target_idx = unwenv._picture_target
     target_veg = unwenv.veggies[target_idx]
+    dishwasher_x_bounds = None
+    for name, actor in unwenv.scene.actors.items():
+        if "dishwasher" not in name.lower():
+            continue
+        aabbs = [body.get_global_aabb_fast() for body in actor._bodies]
+        if aabbs:
+            dishwasher_x_bounds = (
+                min(float(aabb[0][0]) for aabb in aabbs),
+                max(float(aabb[1][0]) for aabb in aabbs),
+            )
+        break
     print(f"Target vegetable (from fridge picture): {target_veg.name}")
     _pose_render_cameras(env, target_veg)  # per-episode camera poses
 
@@ -1029,6 +1040,22 @@ def planning(env, seed, debug=False, vis=None, info=False):
             # NOTE: the arm stays folded; the reach plans FROM the folded pose
             # pi-lens-ignore: unchecked-throwing-call-python
             # (a set_qpos unfold would push the TCP into the counter volume)
+
+            # Targets above the dishwasher need a small torso lift before the
+            # standard arm reach; keep the adjacent counter trajectory.
+            over_dishwasher = (
+                dishwasher_x_bounds is not None
+                and dishwasher_x_bounds[0] <= veg_center[0] <= dishwasher_x_bounds[1]
+            )
+            if over_dishwasher:
+                arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+                body_action = agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
+                body_action[0] = body_action[1] = 0.0
+                body_action[2] = max(float(body_action[2]), 0.10)
+                for _ in range(20):
+                    env.step(np.hstack([arm_action, 1, body_action,
+                                        np.array([0.0, 0.0, 0.0])]))
+                planner.planner.update_from_simulation()
 
             print("Reaching + grasping target vegetable")
             env.log_event("phase", "Reaching target vegetable")
