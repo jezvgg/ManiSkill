@@ -896,7 +896,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     vis = vis or env.unwrapped.render_mode == "human"
 
     unwenv: MyRoboCasaFridgeVeggies = env.unwrapped
-    _install_render_cameras(env)  # BEFORE reset: camera configs are read at reconfigure
+    if unwenv.render_mode is not None:
+        _install_render_cameras(env)  # configs are read during reconfigure
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
     # ManiSkill resolves agent/controller types dynamically at runtime.
     agent: Any = unwenv.agent  # must be captured AFTER the reconfigure reset
@@ -907,7 +908,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     target_idx = unwenv._picture_target
     target_veg = unwenv.veggies[target_idx]
     print(f"Target vegetable (from fridge picture): {target_veg.name}")
-    _pose_render_cameras(env, target_veg)  # per-episode camera poses
+    if unwenv.render_mode is not None:
+        _pose_render_cameras(env, target_veg)  # per-episode camera poses
 
     # --- Approach the target vegetable --------------------------------------
     # No teleportation: the base DRIVES. The robot may spawn right next to the
@@ -1537,8 +1539,8 @@ if __name__ == "__main__":
     env = gym.make(
         "MyRoboCasa_FridgeVeggies-v1",
         num_envs=1,
-        render_mode=args.render_mode,
-        obs_mode="rgb",
+        render_mode=None if args.no_video else args.render_mode,
+        obs_mode="state" if args.no_video else "rgb",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),

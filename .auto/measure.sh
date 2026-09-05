@@ -13,7 +13,7 @@ find logs -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 # cached logs so this iteration cannot count another run's terminal events.
 ssh -o BatchMode=yes -o ConnectTimeout=15 gangway 'rm -rf ~/gw-runs/src/logs' >/dev/null 2>&1 || true
 
-SCRIPT=$(find "$(git rev-parse --show-toplevel)/skills" -name remote_analyze.sh | head -1)
+SCRIPT="$(git rev-parse --show-toplevel)/.auto/remote_analyze_reliable.sh"
 NO_VIDEO=1 bash "$SCRIPT" "$PLANNER_NAME" "$SEED_COUNT" "$WORKERS"
 
 python3 - <<'PY'
