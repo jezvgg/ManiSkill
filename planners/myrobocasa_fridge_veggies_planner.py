@@ -925,9 +925,20 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # fridge with the extended arm poking INTO it (which makes every screw plan
     # fail), so fold the arm to the rest config first, drive, then unfold.
     mesh = target_veg.get_first_collision_mesh(to_world_frame=True)
+    severe_grasp_geometry = False
     if mesh is not None:
         obb: Box = mesh.bounding_box_oriented
         veg_center = obb.center_mass.copy()
+        axes = np.asarray(obb.transform)[:3, :3]
+        world_ext = np.asarray(obb.extents)
+        local_ext = np.asarray(obb.primitive.extents)
+        horiz = [i for i in range(3) if abs(axes[2, i]) < 0.5]
+        if len(horiz) > 1:
+            old_i = min(horiz, key=lambda i: world_ext[i])
+            new_i = min(horiz, key=lambda i: local_ext[i])
+            severe_grasp_geometry = (
+                local_ext[old_i] > 0.10 and local_ext[new_i] < 0.035
+            )
 
     home_qpos = agent.robot.qpos[0].cpu().numpy().copy()
     arm_idx = agent.controller.controllers["arm"].active_joint_indices.cpu().numpy()
@@ -964,11 +975,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # region (the 0.6-0.7 m band was marginal - the same geometry succeeded
     # or failed depending on the mplib RNG). 0.8 m stances never succeeded
     # (beyond the reach) and were dropped.
-    stance_dirs = [
-        np.array([0.0, -1.0]),
+    straight = np.array([0.0, -1.0])
+    diagonals = [
         np.array([0.5, -0.8660254]),
         np.array([-0.5, -0.8660254]),
     ]
+    stance_dirs = diagonals + [straight] if severe_grasp_geometry else (
+        [straight] + diagonals
+    )
     for sdir in stance_dirs:
         for dist in (0.5, 0.6):
             # fold the arm again before any drive: after a failed grasp the arm
