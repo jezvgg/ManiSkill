@@ -886,7 +886,7 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
             # of the fingertip grip (observed drops); 0.18 is gentle enough
             res = _velocity_segment(env, planner, waypoint, arm_action,
                                     body_action, planner.gripper_state,
-                                    speed=0.18)
+                                    speed=0.18, x_min=0.05)
         planner.planner.update_from_simulation()
     print(f"[INFO] transport: did not converge after {max_iter} iterations")
     return -1

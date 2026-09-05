@@ -339,7 +339,7 @@ def _velocity_segment(env, planner, target_pos, arm_action, body_action,
                       burst_steps=6, dead_move=0.01,
                       max_steps=3000, min_improve=0.08, stall_bursts=10,
                       initial_backward=False, target_yaw=None, tol=0.12,
-                      y_guard=True):
+                      y_guard=True, x_min=0.35):
     """Omnidirectional closed-loop base drive toward target_pos.
 
     The base chassis is HOLONOMIC (independent root x/y prismatic joints),
@@ -486,7 +486,7 @@ def _velocity_segment(env, planner, target_pos, arm_action, body_action,
         _bx = agent.base_link.pose.p[0].cpu().numpy()[0]
         # the base SPAWNS at x~3.4 (east of the counter); allow the spawn
         # corridor but still catch the transport's eastward wander (x=5.1)
-        if _bx > 3.6 or _bx < 0.35:
+        if _bx > 3.6 or _bx < x_min:
             print(f"[INFO] _velocity_segment: base left the driving corridor "
                   f"(x={_bx:.2f}); aborting")
             break
