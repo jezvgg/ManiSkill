@@ -622,9 +622,18 @@ def _reach_and_grasp(env, planner, agent, pre_clear=0.14):
     if mesh is not None:
         obb = mesh.bounding_box_oriented
         T = np.asarray(obb.transform)[:3, :3]  # OBB axes (columns)
-        ext = np.asarray(obb.extents)
-        # horizontal axes only (small world-z component), shortest first
+        world_ext = np.asarray(obb.extents)
+        local_ext = np.asarray(obb.primitive.extents)
+        # Horizontal axes only (small world-z component). Correct the extent
+        # ranking only for near-equivalent widths; dramatic orientation swaps
+        # regressed otherwise-valid elongated grasps.
         horiz = [i for i in range(3) if abs(T[2, i]) < 0.5]
+        ext = world_ext
+        if len(horiz) > 1:
+            old_i = min(horiz, key=lambda i: world_ext[i])
+            new_i = min(horiz, key=lambda i: local_ext[i])
+            if local_ext[old_i] <= 1.2 * local_ext[new_i]:
+                ext = local_ext
         horiz.sort(key=lambda i: ext[i])
         for i in horiz:
             ax = np.asarray(T[:, i], dtype=float).copy()
