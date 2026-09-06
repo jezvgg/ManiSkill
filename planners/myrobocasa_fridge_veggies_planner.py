@@ -592,7 +592,7 @@ def _descend_tcp_abs(env, planner, tgt, n_init_qpos=100):
     return -1
 
 
-def _reach_and_grasp(env, planner, agent, pre_clear=0.14):
+def _reach_and_grasp(env, planner, agent, pre_clear=0.14, rank_closings=False):
     """Reach the pre-grasp pose then execute the grasp. ONLY top-down grasps
     are attempted: the gripper approaches straight down (-z) and the fingers
     close along a horizontal world axis (x or y). Straight/side grasps are
@@ -646,6 +646,27 @@ def _reach_and_grasp(env, planner, agent, pre_clear=0.14):
         np.array([0.0, 1.0, 0.0]),
     ]
     veg_name = _veg_world_name(veg)
+    if rank_closings:
+        center = veg.pose.p[0].cpu().numpy().copy()
+        qpos = planner.robot.get_qpos().cpu().numpy()[0]
+        masked_joints = ~np.array([True, True, True] + [False] * 12)
+
+        def closing_score(tc):
+            _, reach_pose = _top_down_grasp_pose(
+                agent, center, tc, 0.0, pre_clear
+            )
+            result = planner.planner.plan_screw(
+                mplib.Pose(p=reach_pose.p, q=reach_pose.q),
+                qpos,
+                time_step=env.unwrapped.control_timestep,
+                masked_joints=masked_joints,
+            )
+            if result.get("status") != "Success":
+                return float("inf")
+            path = np.asarray(result["position"])
+            return float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
+
+        closings.sort(key=closing_score)
     for tc in closings:
         # re-read the vegetable pose: the previous reach may have knocked it
         obj_center = (
@@ -1063,7 +1084,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
             grasp_pose = None
             for pre_clear in (0.14, 0.10):
                 grasp_pose = _reach_and_grasp(
-                    env, planner, agent, pre_clear=pre_clear
+                    env,
+                    planner,
+                    agent,
+                    pre_clear=pre_clear,
+                    rank_closings=severe_grasp_geometry,
                 )
                 planner.planner.update_from_simulation()
                 if grasp_pose is not None:
