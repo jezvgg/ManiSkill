@@ -1078,7 +1078,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             # grasp is rejected here and the next stance is tried.
             print("Grasp vegetable")
             env.log_event("phase", "Grasp target vegetable")
-            planner.close_gripper()
+            planner.close_gripper(t=12 if severe_grasp_geometry else 6)
             planner.planner.update_from_simulation()
             veg_z0 = float(target_veg.pose.p[0].cpu().numpy()[2])
 
