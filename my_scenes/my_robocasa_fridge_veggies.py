@@ -44,7 +44,8 @@ class MyRoboCasaFridgeVeggies(MyRoboCasaFridgePicture):
     # anything that must be lifted is confined to the front strip; same fix as
     # MyRoboCasaSceneTakeItBack.
     CAB_FRONT_Y = -0.45  # front face of the wall cabinets
-    LIFT_CLEAR_GAP = 0.02  # clearance from the cabinet front for the lift
+    LIFT_CLEAR_GAP = 0.08  # vegetable clearance from the cabinet front
+    POT_CAB_GAP = 0.02  # pot may sit further in; it is not lifted
     FRONT_GAP = 0.03  # inset from the counter front edge for the strip
 
     #: Categories excluded from the pool. Potato is excluded: the ds_fetch
@@ -293,7 +294,7 @@ class MyRoboCasaFridgeVeggies(MyRoboCasaFridgePicture):
         top = self._counter_top()
         cy0 = self.counter_pos[1] - self.counter_size[1] / 2
         y0 = cy0 + self.FRONT_GAP
-        y1 = self.CAB_FRONT_Y - self.LIFT_CLEAR_GAP
+        y1 = self.CAB_FRONT_Y - self.POT_CAB_GAP
         strip = [
             np.array([r[0], r[1], max(r[2], y0), min(r[3], y1)])
             for r in self.usable_regions
@@ -435,11 +436,11 @@ class MyRoboCasaFridgeVeggies(MyRoboCasaFridgePicture):
                     north = min(r[3], self.CAB_FRONT_Y - 0.015) - 0.03
                     y_lo, y_hi = north - 0.03, north
                 else:
-                    # v2: vegetables may sit anywhere from their old south
-                    # pin up to the strip's (extended) north end - more front
-                    # edge margin for the whole spawn population.
-                    y_lo = r[2] + h[1]
-                    y_hi = min(r[3], y_lo + 0.06) - 0.01
+                    # Keep the proven vegetable/cabinet clearance while
+                    # moving each vegetable 5 mm further from the front edge.
+                    veg_north = min(r[3], self.CAB_FRONT_Y - self.LIFT_CLEAR_GAP)
+                    y_lo = r[2] + h[1] + 0.005
+                    y_hi = r[2] + (veg_north - r[2]) * 0.4 + 0.005
                 c = np.array([
                     rng.uniform(r[0] + h[0], r[1] - h[0]),
                     rng.uniform(y_lo, max(y_hi, y_lo + 0.005)),
