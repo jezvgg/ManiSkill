@@ -2,6 +2,17 @@
 
 ## Objective
 
+> **Amendment 2026-09-07 (user directive, overrides the scene read-only rule for
+> exactly this change):** scene layout v2 in `my_scenes/my_robocasa_fridge_veggies.py`
+> moves objects inward from the counter front edge. `LIFT_CLEAR_GAP` changes
+> 0.08→0.02 to extend the placement strip north; vegetables now spawn around
+> y=-0.494..-0.514 (13.6–15.6 cm from edge y=-0.65, roughly 1–2 cm more inset).
+> The pot moves from y≈-0.56 to y≈-0.51; its 9.6 cm rim is fully on the counter
+> instead of overhanging the edge. Benchmark distribution changed: metrics are
+> re-baselined from the first v2 run with committed planner `37892bc4`; old
+> 94/99 results are historical only. No further scene/evaluation edits without
+> a new user directive.
+
 Improve `myrobocasa_takeitback_planner` until all 50 evaluation seeds succeed (`50/50`). The task moves the cup from its counter position onto the tray, regrips it, and returns it to the original counter position. Prefer a better geometric strategy (reachable poses, approach corridor, base/arm/torso configuration, and transport geometry) over piles of seed-specific retries or small threshold tweaks. Do not overfit to the current seed batch and do not alter the task/evaluation to fake success.
 
 ## Metrics
