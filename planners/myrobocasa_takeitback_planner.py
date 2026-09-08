@@ -648,6 +648,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
         env.log_event("result", "Task aborted", success=success)
         env.reset()
         return success
+    # Turn-drive-turn preserves base heading, but the absolute arm controller
+    # can retain yaw-induced tracking error; restore existing bent carry pose
+    # before computing the next live TCP offset.
+    ramp_arm(_bent_arm, steps=60)
     report_stage("1 at cup x")
 
     env.log_event("phase", "Stage 2: pre-grasp position")

@@ -885,14 +885,7 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
                   f"h={np.degrees(h):.1f} veg_local={np.round(veg_local, 3)} "
                   f"rem={np.round(rem, 3)}")
             return -1
-        # slow rotation to face the drive direction; the veg swings on its
-        # orbit, so the rem below is re-measured AFTER the swing
-        err = ((h_drive - h + np.pi) % (2 * np.pi)) - np.pi
-        if abs(err) > np.deg2rad(2):
-            _rotate_base_to(env, planner,
-                            np.array([np.cos(h_drive), np.sin(h_drive), 0.0]),
-                            rot_cap=0.06)
-            planner.planner.update_from_simulation()
+        # Execute each world leg through turn → straight drive → turn-back.
         veg = target_veg.pose.p[0].cpu().numpy()
         rem = np.asarray(aim_xy, dtype=float) - veg[:2]
         if float(np.linalg.norm(rem)) < margin:
@@ -901,12 +894,14 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
         step = min(1.0, 0.4 / max(float(np.linalg.norm(rem)), 1e-6))
         waypoint = base + np.array([rem[0] * step, rem[1] * step, 0.0])
         waypoint[1] = min(waypoint[1], -1.0)
-        res = _screw_base_translate(planner, waypoint)
-        if res == -1:
-            # the fixed-arm screw is picky about start states; the yaw-free
-            # move_base_forward replans the arm (safe: the veg is north of the
-            # base, the arm stays above the fixtures)
-            res = planner.move_base_forward(waypoint, n_init_qpos=100)
+        arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+        body_action = agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
+        body_action[0] = body_action[1] = 0.0
+        res = _velocity_segment(
+            env, planner, waypoint, arm_action, body_action,
+            planner.gripper_state, speed=0.18, max_bursts=80,
+            tol=0.06, y_guard=False, x_min=0.05,
+        )
         if res == -1:
             arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
             body_action = agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()

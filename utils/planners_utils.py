@@ -1,8 +1,9 @@
-import gymnasium as gym
 import numpy as np
-import sapien
-import torch
 import mplib
+
+from mani_skill.examples.motionplanning.fetch.extand import (
+    FetchMotionPlanningSapienSolver,
+)
 
 
 # persistent cmd->world map estimate for the holonomic base drive: a robot
@@ -19,9 +20,60 @@ _BASE_MAP_EGO = None
 _CAL_HEADING = None
 _BASE_MAP_DET = None
 
-def _base_cmd(vx=0.0, vy=0.0, w=0.0):
-    """Base velocity command for PDBaseVelController: [vx_fwd, vy_left, w_yaw]"""
-    return np.array([vx, vy, w])
+def _base_cmd(vx=0.0, w=0.0):
+    """Fetch base command: [forward_velocity, 0 lateral, yaw_velocity]."""
+    return np.array([vx, 0.0, w])
+
+
+def _follow_moving_forward(self, result, refine_steps=0):
+    """Old Fetch executor: project planned XY velocity onto forward axis."""
+    n_step = result["position"].shape[0]
+    root_to_world = self.env_agent.robot.root_pose.sp.to_transformation_matrix()[:3, :3]
+    base_direction = self.env_agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
+    for i in range(n_step + refine_steps):
+        arm_action = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+        body_action = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
+        body_action[0] = body_action[1] = 0.0
+        qvel = result["velocity"][min(i, n_step - 1)]
+        world_velocity = root_to_world @ np.array([qvel[0], qvel[1], 0.0])
+        base_action = _base_cmd(float(np.dot(world_velocity, base_direction)))
+        obs, reward, terminated, truncated, info = self.env.step(
+            np.hstack([arm_action, self.gripper_state, body_action, base_action])
+        )
+        self.elapsed_steps += 1
+        if self.print_env_info:
+            print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
+        if self.vis:
+            self.base_env.render_human()
+    return obs, reward, terminated, truncated, info
+
+
+_legacy_follow_path = FetchMotionPlanningSapienSolver.follow_forward_path_w_refinement
+
+
+def _follow_forward_path_w_refinement(self, result, refine=False, static=False):
+    """Run old arm-path executor while projecting its base action to forward."""
+    original_step = self.env.step
+
+    def step(action):
+        action = np.asarray(action)
+        if action.shape == (14,):
+            agent = self.env.unwrapped.agent
+            matrix = agent.base_link.pose.sp.to_transformation_matrix()
+            world_velocity = matrix[:2, :2] @ action[-3:-1]
+            forward = float(np.dot(world_velocity, matrix[:2, 0]))
+            action = np.hstack([action[:-3], [forward, 0.0, action[-1]]])
+        return original_step(action)
+
+    self.env.step = step
+    try:
+        return _legacy_follow_path(self, result, refine, static)
+    finally:
+        self.env.step = original_step
+
+
+FetchMotionPlanningSapienSolver.follow_moving_forward = _follow_moving_forward
+FetchMotionPlanningSapienSolver.follow_forward_path_w_refinement = _follow_forward_path_w_refinement
 
 
 def lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=False, arm_action=None, gripper_action=None):
@@ -172,6 +224,8 @@ def _rotate_base_to(env, planner, dir_world, max_rot=300, rot_gain=1.2,
         # Monotonic rotation stays in-range and always reaches the target.
         he = np.arctan2(dt[1], dt[0]) - np.arctan2(xa[1], xa[0])
         if abs((he + np.pi) % (2 * np.pi) - np.pi) < np.deg2rad(align_deg):
+            for _ in range(30):
+                env.step(np.hstack([arm_action, gripper_action, body_action, _base_cmd()]))
             return
         ba = _base_cmd(w=float(np.clip(rot_gain * he, -rot_cap, rot_cap)))
         env.step(np.hstack([arm_action, gripper_action, body_action, ba]))
@@ -238,20 +292,14 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
             print(f"[INFO] drive_base_to_position: base crossed north of the counter "
                   f"(y={base_p[1]:.2f}); aborting")
             return -1
-        # NO rotation for the screw drive: the base is holonomic
-        # (PDBaseVelController), so move_base_forward drives straight toward
-        # the waypoint from any heading. Rotating first (a forward-only-era
-        # leftover) fights the screw: the yaw-joint motion rotates the base
-        # link mid-drive and the plan's base-joint frame conversion drifts,
-        # so a big rotation (seed 18 spawned 0.27 m from the target and tried
-        # a +127 deg turn) sent the base off at a fixed local bearing instead
-        # of toward the target. The heading for the REACH is set later by the
-        # heading fix, not here.
+        original_heading = agent.base_link.pose.sp.to_transformation_matrix()[:3, 0].copy()
         delta = target - base_p
-        waypoint = base_p + delta * min(1.0, chunk / max(dist, 1e-6))
-        # the mplib screw fails EXACTLY on pure -x motions (verified: bearing
-        # 180 deg fails, 175/185 deg succeed), so perturb the waypoint in y to
-        # break the degeneracy; the 5 cm offset is re-measured next iteration
+        _rotate_base_to(env, planner, delta, rot_cap=rot_cap)
+        planner.planner.update_from_simulation()
+        base_p = agent.base_link.pose.sp.p.copy()
+        base_p[2] = 0.0
+        delta = target - base_p
+        waypoint = base_p + delta * min(1.0, chunk / max(float(np.linalg.norm(delta)), 1e-6))
         waypoint[1] += 0.05
         res = planner.move_base_forward(waypoint, n_init_qpos=100)
         if res == -1:
@@ -270,7 +318,9 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
             for _ in range(30):
                 env.step(np.hstack([arm_action, gripper_action, body_action,
                                     _base_cmd()]))
+            _rotate_base_to(env, planner, original_heading, rot_cap=rot_cap)
             continue
+        _rotate_base_to(env, planner, original_heading, rot_cap=rot_cap)
         planner.planner.update_from_simulation()
     he, dist, base_p = heading_error()
     if dist < 0.15:
@@ -281,43 +331,53 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
 
 
 def _screw_base_translate(planner, target_base_pos):
-    """Translate the base to target_base_pos with a screw plan that keeps the
-    ARM FIXED: move_base_forward frees the arm joints, so its screw replans
-    the arm and swings a held object behind the base (which then cannot place
-    it). The fixed-arm screw needs the arm held HIGH (above the fixtures) so
-    the swept volume stays collision-free. Returns 0 on success, -1 on
-    failure."""
+    """Translate base using turn → straight drive → turn-back."""
     agent = planner.base_env.agent
-    tcp_pose = agent.tcp.pose.sp
-    base_link_pose = agent.base_link.pose.sp
-    delta = np.asarray(target_base_pos, dtype=float) - base_link_pose.p
+    base_pose = agent.base_link.pose.sp
+    original_heading = base_pose.to_transformation_matrix()[:3, 0].copy()
+    delta = np.asarray(target_base_pos, dtype=float) - base_pose.p
     delta[2] = 0.0
-    target_tcp = mplib.Pose(p=tcp_pose.p + delta, q=tcp_pose.q)
-    try:
-        result = planner.planner.plan_screw(
-            target_tcp,
-            planner.robot.get_qpos().cpu().numpy()[0],
-            time_step=planner.base_env.control_timestep,
-            # base x/y/yaw + torso free, ARM FIXED (masked_joints=True = free)
-            masked_joints=[True, True, True, True] + [False] * 11,
-        )
-    except Exception as e:
-        # TOPP-Ra can RAISE (e.g. FailUncontrollable on degenerate paths)
-        # instead of returning a failure status; degrade to the caller's
-        # velocity fallback like a returned failure
-        print(f"[INFO] Transport: fixed-arm screw raised {type(e).__name__}")
-        return -1
+    if np.linalg.norm(delta) > 1e-6:
+        _rotate_base_to(planner.env, planner, delta, rot_cap=0.12)
+        planner.planner.update_from_simulation()
+        base_pose = agent.base_link.pose.sp
+        delta = np.asarray(target_base_pos, dtype=float) - base_pose.p
+        delta[2] = 0.0
+    tcp_pose = agent.tcp.pose.sp
+    result = planner.planner.plan_screw(
+        mplib.Pose(p=tcp_pose.p + delta, q=tcp_pose.q),
+        planner.robot.get_qpos().cpu().numpy()[0],
+        time_step=planner.base_env.control_timestep,
+        masked_joints=[True, True, True, True] + [False] * 11,
+    )
     if result["status"] != "Success":
+        _rotate_base_to(planner.env, planner, original_heading, rot_cap=0.12)
         return -1
-    # follow_moving_forward, NOT follow_path: the ds_fetch base x/y joints are
-    # driven by a VELOCITY controller, so the screw path's position targets
-    # (follow_path) never move the base - the path must be executed through
-    # the base velocity action (the same executor move_base_forward uses to
-    # drive the base to the stances). The arm joints are masked (fixed) in
-    # the screw, so the held object stays rigid in the base frame.
     planner.follow_moving_forward(result)
+    for _ in range(2):
+        current = agent.base_link.pose.sp.p.copy()
+        current[2] = 0.0
+        if np.linalg.norm(np.asarray(target_base_pos)[:2] - current[:2]) > 0.03:
+            _velocity_segment(
+                planner.env,
+                planner,
+                target_base_pos,
+                agent.controller.controllers["arm"].qpos[0].cpu().numpy(),
+                agent.controller.controllers["body"].qpos[0].cpu().numpy(),
+                planner.gripper_state,
+                speed=0.18,
+                max_bursts=40,
+                tol=0.03,
+                y_guard=False,
+                x_min=-np.inf,
+            )
+        _rotate_base_to(planner.env, planner, original_heading, rot_cap=0.12)
+        current = agent.base_link.pose.sp.p.copy()
+        current[2] = 0.0
+        if np.linalg.norm(np.asarray(target_base_pos)[:2] - current[:2]) <= 0.03:
+            break
+    planner.planner.update_from_simulation()
     return 0
-
 
 def _current_object_pos(env, planner):
     """Re-read the tracked object's live world position from the simulation.
@@ -337,242 +397,85 @@ def _current_object_pos(env, planner):
 def _velocity_segment(env, planner, target_pos, arm_action, body_action,
                       gripper_action, speed=0.18, max_bursts=80,
                       burst_steps=6, dead_move=0.01,
-                      max_steps=3000, min_improve=0.08, stall_bursts=10,
+                      max_steps=3000, min_improve=0.01, stall_bursts=20,
                       initial_backward=False, target_yaw=None, tol=0.12,
                       y_guard=True, x_min=0.35):
-    """Omnidirectional closed-loop base drive toward target_pos.
-
-    The base chassis is HOLONOMIC (independent root x/y prismatic joints),
-    but its response to an ego-frame velocity command is a fixed-but-unknown
-    linear map M (URDF axis conventions + PhysX friction). Instead of guessing
-    headings and signs, this driver COMMANDS a velocity vector, MEASURES the
-    resulting world displacement, incrementally learns M (rank-1 LMS), and
-    then steers straight at the target through M^-1. Works through every
-    frame/sign quirk of the fork; never rotates in place while translating.
-
-    Guards: abort with -1 on no-progress (dead zone / limit cycle), on the
-    base crossing north of the counter front line, or on exhausting the step
-    budget. initial_backward is accepted for compatibility and ignored."""
-    unwenv = env.unwrapped
-    agent = unwenv.agent
+    """Drive world target with turn → forward/backward → turn-back."""
+    agent = env.unwrapped.agent
     target = np.asarray(target_pos, dtype=float).copy()
     target[2] = 0.0
 
-    def pose_xy():
-        p = agent.base_link.pose.p[0].cpu().numpy()[:2]
-        q = agent.base_link.pose.q[0].cpu().numpy()
-        # z-yaw from quaternion (w,x,y,z): atan2(2(wz+xy), 1-2(y^2+z^2)).
-        # NOTE: the naive (q3*q2 + q0*q1)/(1-2(q1^2+q2^2)) variant is WRONG
-        # for z-rotations (returns 0 always) and silently broke the map
-        # rotation + recalibration trigger; keep this exact form
-        yaw = np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
-                         1 - 2 * (q[2] ** 2 + q[3] ** 2))
-        return p, yaw
+    def position():
+        return agent.base_link.pose.sp.p.copy()[:2]
 
-    arm_n = len(np.atleast_1d(arm_action))
-    grip_n = len(np.atleast_1d(gripper_action))
-    body_n = len(np.atleast_1d(body_action))
+    def heading():
+        matrix = agent.base_link.pose.sp.to_transformation_matrix()
+        return float(np.arctan2(matrix[1, 0], matrix[0, 0]))
 
-    def burst(vx, vy, n, w=0.0):
-        a = np.zeros(arm_n + grip_n + body_n + 3)
-        a[:arm_n] = arm_action
-        a[arm_n:arm_n + grip_n] = gripper_action
-        a[arm_n + grip_n:arm_n + grip_n + body_n] = body_action
-        a[-3:] = [vx, vy, w]
-        p0 = agent.base_link.pose.p[0].cpu().numpy()[:2]
-        for _ in range(n):
-            env.step(a)
-        return agent.base_link.pose.p[0].cpu().numpy()[:2] - p0
+    def wrapped(angle):
+        return (angle + np.pi) % (2 * np.pi) - np.pi
 
-    global _BASE_MAP_EGO, _CAL_HEADING, _BASE_MAP_DET
-    yaw0 = pose_xy()[1]
-    yaw_prev = yaw0
-    if _BASE_MAP_EGO is None or abs(yaw0 - _CAL_HEADING) > np.deg2rad(25):
-        print(f"[INFO] _velocity_segment: calibrating base map at yaw "
-              f"{np.degrees(yaw0):.1f} deg")
-        Mc = np.zeros((2, 2))
-        # command at FULL amplitude: the base has a static-friction dead zone
-        # at low velocities (a 0.3 cmd measured ~0 motion near the fixtures),
-        # which makes the calibrated map garbage; 0.8 reliably breaks free
-        for j, (ax, ay) in enumerate([(0.6, 0.0), (0.0, 0.6)]):
-            Mc[:, j] = burst(ax, ay, 4, w=0.0) / 4 / 0.6
-            if np.linalg.norm(Mc[:, j]) < 0.005:
-                Mc[:, j] = burst(ax, ay, 8, w=0.0) / 8 / 0.6  # retry, longer burst
-            if np.linalg.norm(Mc[:, j]) < 0.005:
-                # the FORWARD command is dead: the base's joints can be dead
-                # in one direction at some configs (verified seed 9: the x
-                # joint barely moved forward at the spawn, yaw 169 deg). The
-                # REVERSE response is often alive (the old code's
-                # "reverse-burst"); fold the measured reverse into the column
-                # so the steering can drive that axis backward.
-                Mc[:, j] = -burst(-ax, -ay, 8, w=0.0) / 8 / 0.6
-                print(f"[INFO] _velocity_segment: axis {j} dead forward, "
-                      f"reverse response {np.round(Mc[:, j], 4)}")
-        if np.linalg.det(Mc) < 1e-4:
-            # the forward probes are nearly PARALLEL (dead-zone map, seed 9:
-            # the spawn at yaw 169, det ~1e-5): the forward response is dead
-            # but the REVERSE is often alive there. Probe the reverse of both
-            # axes and keep whichever column is stronger.
-            for j, (ax, ay) in enumerate([(0.6, 0.0), (0.0, 0.6)]):
-                r = -burst(-ax, -ay, 8, w=0.0) / 8 / 0.6
-                if np.linalg.norm(r) > np.linalg.norm(Mc[:, j]):
-                    Mc[:, j] = r
-            print(f"[INFO] _velocity_segment: singular map, reverse-probed "
-                  f"Mc={np.round(Mc, 4).tolist()}")
-        _CAL_HEADING = yaw0
-        c, s = np.cos(yaw0), np.sin(yaw0)
-        _BASE_MAP_EGO = np.array([[c, s], [-s, c]]) @ Mc
-        global _BASE_MAP_DET
-        _BASE_MAP_DET = float(np.linalg.det(Mc))
-        print(f"[INFO] _velocity_segment: calibrated Mc={np.round(Mc, 4).tolist()} "
-              f"det={_BASE_MAP_DET:.2e}")
-    steps = 0
-    # initial world map from the start heading; the loop recomputes it from
-    # the live yaw every burst
-    c0, s0 = np.cos(yaw0), np.sin(yaw0)
-    M = np.array([[c0, -s0], [s0, c0]]) @ _BASE_MAP_EGO
-    best_dist = float(np.linalg.norm(target[:2] - pose_xy()[0]))
+    def stop():
+        action = np.hstack([arm_action, gripper_action, body_action, _base_cmd()])
+        for _ in range(30):
+            env.step(action)
+
+    start_heading = heading()
+    base = position()
+    delta = target[:2] - base
+    dist = float(np.linalg.norm(delta))
+    if dist <= tol:
+        stop()
+        planner.planner.update_from_simulation()
+        return 0
+
+    bearing = float(np.arctan2(delta[1], delta[0]))
+    reverse = bool(initial_backward or abs(wrapped(bearing - start_heading)) > np.pi / 2)
+    drive_bearing = bearing + (np.pi if reverse else 0.0)
+    _rotate_base_to(env, planner, np.array([np.cos(drive_bearing), np.sin(drive_bearing), 0.0]))
+
+    best_dist = dist
     stalled = 0
+    steps = 0
     for _ in range(max_bursts):
-        base0, yaw_b = pose_xy()
-        dvec = target[:2] - base0
-        dist = float(np.linalg.norm(dvec))
-        if dist < tol and (target_yaw is None or
-                            abs((target_yaw - yaw_b + np.pi) % (2 * np.pi) - np.pi)
-                            < np.deg2rad(8)):
-            # BRAKE: the last burst's velocity target persists in the PD
-            # controller, so the base coasts up to ~0.2 m past the target
-            # before the next phase's action zeroes it (verified seed 18: the
-            # base overshot the stance by 0.16 m and the reach then knocked
-            # the cup off the counter edge). Hold zero velocity for a few
-            # steps to actually stop.
-            a0 = np.zeros(arm_n + grip_n + body_n + 3)
-            a0[:arm_n] = arm_action
-            a0[arm_n:arm_n + grip_n] = gripper_action
-            a0[arm_n + grip_n:arm_n + grip_n + body_n] = body_action
-            for _ in range(30):
-                env.step(a0)
-            return 0
-        if dist > best_dist + 1.0:
-            print(f"[INFO] _velocity_segment: diverging (dist {dist:.2f} m); aborting")
+        base = position()
+        delta = target[:2] - base
+        dist = float(np.linalg.norm(delta))
+        if dist <= tol:
             break
-        if dist < best_dist - min_improve:
-            best_dist = dist
+        if y_guard and base[1] > -0.95 and delta[1] >= -0.02:
+            break
+        if base[0] > 3.6 or base[0] < x_min:
+            break
+        drive_bearing = float(np.arctan2(delta[1], delta[0])) + (np.pi if reverse else 0.0)
+        if abs(wrapped(drive_bearing - heading())) > np.deg2rad(8):
+            _rotate_base_to(env, planner, np.array([np.cos(drive_bearing), np.sin(drive_bearing), 0.0]))
+        forward = min(speed, 1.5 * dist) * (-1.0 if reverse else 1.0)
+        action = np.hstack([arm_action, gripper_action, body_action, _base_cmd(forward)])
+        count = max(1, min(burst_steps, int(burst_steps * dist / 0.25)))
+        for _ in range(count):
+            env.step(action)
+        steps += count
+        new_dist = float(np.linalg.norm(target[:2] - position()))
+        if new_dist < best_dist - min_improve:
+            best_dist = new_dist
             stalled = 0
         else:
             stalled += 1
-            if stalled >= stall_bursts:
-                print(f"[INFO] _velocity_segment: no progress toward target "
-                      f"(best {best_dist:.2f} m, now {dist:.2f} m); aborting")
-                break
-        _, yaw = pose_xy()
-        if yaw > -np.deg2rad(2) or yaw < -np.deg2rad(178):
-            pass  # heading free: no in-place rotations during translation
-        base_y = agent.base_link.pose.p[0].cpu().numpy()[1]
-        if y_guard and base_y > -0.95:
-            if dvec[1] < -0.02:
-                # north of the counter line, but the TARGET is south of the
-                # base: the closed loop would steer back south on its own,
-                # but the guard fires before it can move. Allow the drive -
-                # the transport's west translations drift north on a
-                # near-singular base map, and aborting here deadlocks it
-                # (observed: 13+ retries stuck at y=-0.94, each aborting on
-                # the first loop check before any motion).
-                pass
-            else:
-                print(f"[INFO] _velocity_segment: base crossed north of the counter "
-                      f"(y={base_y:.2f}); aborting")
-                break
-        _bx = agent.base_link.pose.p[0].cpu().numpy()[0]
-        # the base SPAWNS at x~3.4 (east of the counter); allow the spawn
-        # corridor but still catch the transport's eastward wander (x=5.1)
-        if _bx > 3.6 or _bx < x_min:
-            print(f"[INFO] _velocity_segment: base left the driving corridor "
-                  f"(x={_bx:.2f}); aborting")
+        if new_dist < tol:
+            break
+        if np.linalg.norm(target[:2] - base) < dead_move:
+            stalled += 2
+        if stalled >= stall_bursts or steps >= max_steps:
             break
 
-        # steer: solve the ego command that produces world motion along dvec;
-        # scale the speed down with the remaining distance so short final
-        # hops land inside the convergence radius instead of overshooting
-        wdir = dvec / dist
-        v_des = wdir * min(speed, 1.5 * dist)
-        # the world map = R(current yaw) @ ego map, recomputed EVERY burst:
-        # the base's yaw DRIFTS during the drive (PhysX slide, up to 40 deg)
-        # and a map frozen at the start heading steers into a circle
-        cb, sb = np.cos(yaw_b), np.sin(yaw_b)
-        M = np.array([[cb, -sb], [sb, cb]]) @ _BASE_MAP_EGO
-        try:
-            # damped pseudo-inverse: the measured map is near-SINGULAR in the
-            # PhysX dead zones (det ~2e-5 vs ~5e-4 healthy), where the exact
-            # solve explodes and the clamped command drives the base the
-            # WRONG way. The ridge keeps the command along the alive axis.
-            gram = M @ M.T + 1e-4 * np.eye(2)
-            cmd = M.T @ np.linalg.solve(gram, v_des)
-        except np.linalg.LinAlgError:
-            cmd = wdir
-        n_cmd = float(np.linalg.norm(cmd))
-        if n_cmd > 1.0:
-            cmd /= n_cmd
-
-        n_burst = max(2, min(burst_steps, int(burst_steps * dist / 0.25)))
-        # rotate toward the target heading WHILE translating: the in-place
-        # rotation slides the base into dead zones near the fixtures, but the
-        # same rotation spread over the drive is absorbed by the closed loop
-        w = 0.0
-        if _BASE_MAP_DET is not None and _BASE_MAP_DET < 1e-4:
-            # singular dead-zone map: the base's translation is 1-D, and the
-            # alive axis ROTATES with the heading (measured: world-north at
-            # yaw 33.6, world-east at yaw 128.6). A constant spin sweeps the
-            # alive axis so every direction becomes reachable; the closed-loop
-            # steering + the per-burst map rotation absorb it.
-            w = 0.25
-        elif target_yaw is not None:
-            # UNWRAPPED error: the yaw JOINT's travel is limited to +-180 deg
-            # (root frame), so the shortest wrapped path can jam the joint at
-            # the seam and freeze the base mid-rotation (verified: the wrapped
-            # -164 deg path from world -166 froze the base at world +164).
-            # Monotonic rotation toward the target stays in-range and always
-            # reaches it, at the cost of taking the long way when needed.
-            he = target_yaw - pose_xy()[1]
-            w = float(np.clip(1.5 * he, -0.2, 0.2))
-        moved = burst(float(cmd[0]), float(cmd[1]), n_burst, w=w)
-        steps += n_burst
-        m = float(np.linalg.norm(moved))
-
-
-        # the base heading DRIFTS while translating (PhysX artifact, ~0.35
-        # deg/step): rotate the world-frame map to the newly measured heading
-        # so the steering does not lag the rotating frame
-        yaw_now = pose_xy()[1]
-        dy = yaw_now - yaw_prev
-        if abs(dy) > 1e-6:
-            cd, sd = np.cos(dy), np.sin(dy)
-            M = np.array([[cd, -sd], [sd, cd]]) @ M
-            yaw_prev = yaw_now
-
-        # incremental rank-1 LMS update of M from the observed response
-        denom = float(cmd @ cmd)
-        if denom > 1e-9 and m > 1e-6:
-            per_step = moved / n_burst
-            errv = per_step - M @ cmd
-            M += 0.2 * np.outer(errv, cmd) / denom
-
-        if steps < 24:
-            stalled = 0  # warmup: let the map calibration converge first
-        if m < dead_move:
-            stalled += 2  # dead burst counts double toward the stall guard
-        if steps > max_steps:
-            print(f"[INFO] _velocity_segment: step budget exhausted; aborting")
-            break
-    yaw1 = pose_xy()[1]
-    c1, s1 = np.cos(yaw1), np.sin(yaw1)
-    np.copyto(_BASE_MAP_EGO, np.array([[c1, s1], [-s1, c1]]) @ M)
+    final_heading = target_yaw if target_yaw is not None else start_heading
+    _rotate_base_to(env, planner, np.array([np.cos(final_heading), np.sin(final_heading), 0.0]))
+    stop()
     planner.planner.update_from_simulation()
-    base = agent.base_link.pose.p[0].cpu().numpy()[:2]
-    ok = float(np.linalg.norm(target[:2] - base)) < tol
-    print(f"[INFO] _velocity_segment done: {'OK' if ok else 'FAIL'} "
-          f"final dist {float(np.linalg.norm(target[:2] - base)):.3f} m")
-    return 0 if ok else -1
+    dist = float(np.linalg.norm(target[:2] - position()))
+    yaw_ok = target_yaw is None or abs(wrapped(target_yaw - heading())) < np.deg2rad(8)
+    return 0 if dist <= tol and yaw_ok else -1
 
 def lower_torso_until_rest(env, planner, target_drop, *, chunk=0.02,
                            steps_per_chunk=12, rest_tol=0.002, vis=False):
