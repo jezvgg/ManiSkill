@@ -1156,17 +1156,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # which sits 70-91% of the rim radius toward the handle (see
     # _pot_bowl_center)
     plate_center = _pot_bowl_center(env)
-    # v2 moves the pot inward toward the cabinet. Keep the base-heavy carry
-    # in the old south corridor (9 cm inside the front edge), then let the
-    # existing short arm/yaw centering close the final few centimetres.
-    transport_center = plate_center.copy()
-    counter_front_y = float(unwenv.counter_pos[1] - unwenv.counter_size[1] / 2)
-    transport_center[1] = min(transport_center[1], counter_front_y + 0.09)
     print("\n--- Drive base toward plate ---")
     env.log_event("phase", "Drive base toward plate")
     for drive_attempt in range(3):
         veg_now = target_veg.pose.p[0].cpu().numpy()
-        dxy = np.linalg.norm(veg_now[:2] - transport_center[:2])
+        dxy = np.linalg.norm(veg_now[:2] - plate_center[:2])
         # drive until the vegetable is actually over the plate center (0.05):
         # with yaw_sweep=False the transport translates DIRECTLY (no rotation
         # swings the held veg away), so the final few centimetres are safe to
@@ -1185,7 +1179,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             planner,
             agent,
             target_veg,
-            transport_center[:2],
+            plate_center[:2],
             # tight: the raise-then-open release drops the veg ~5 cm and the
             # bounce rolls it up to ~5 cm further, so release near the rim
             # (0.05) ends up oscillating on it. Deliver to 0.03.
@@ -1193,9 +1187,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         )
         planner.planner.update_from_simulation()
         veg_now = target_veg.pose.p[0].cpu().numpy()
-        dxy = np.linalg.norm(veg_now[:2] - transport_center[:2])
-        print(f"[WARN] veggie {dxy:.2f} m from staging target after transport")
-        env.log_event("warn", "Veggie not at transport staging target", dxy=round(float(dxy), 3))
+        dxy = np.linalg.norm(veg_now[:2] - plate_center[:2])
+        print(f"[WARN] veggie {dxy:.2f} m from plate after transport")
+        env.log_event("warn", "Veggie not over plate", dxy=round(float(dxy), 3))
 
     # --- center the vegetable over the plate (base rotation ONLY) ---------
     # The arm-alignment loop (small TCP steps toward the plate) is REMOVED:

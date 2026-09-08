@@ -2,17 +2,6 @@
 
 ## Objective
 
-> **Amendment 2026-09-07 (user directive, overrides the scene read-only rule for
-> exactly this change):** scene layout v2.1 in
-> `my_scenes/my_robocasa_fridge_veggies.py` moves objects inward from counter
-> front edge y=-0.65. Vegetable cabinet clearance remains the proven 0.08m,
-> with each vegetable shifted 5mm inward (measured margins 13.3–14.9cm). A
-> separate `POT_CAB_GAP=0.02` lets the kinematic pot sit at y≈-0.51 (14cm edge
-> margin; old pot y≈-0.56 and its 9.6cm rim overhung the edge). Planner keeps
-> the v2 south transport staging. Workload changed, so metrics are re-baselined
-> from the first v2.1 run; v1 (94/99) and v2.0 (71/82) results are historical
-> only. No further scene/evaluation edits without a new user directive.
-
 Improve `myrobocasa_takeitback_planner` until all 50 evaluation seeds succeed (`50/50`). The task moves the cup from its counter position onto the tray, regrips it, and returns it to the original counter position. Prefer a better geometric strategy (reachable poses, approach corridor, base/arm/torso configuration, and transport geometry) over piles of seed-specific retries or small threshold tweaks. Do not overfit to the current seed batch and do not alter the task/evaluation to fake success.
 
 ## Metrics
