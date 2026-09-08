@@ -1,4 +1,5 @@
 import argparse
+import json
 import random
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,27 @@ LIFT_OFFSETS_STRAIGHT = [
     np.array([0.0, 0.0, 0.18]),
     np.array([0.0, -0.05, 0.15]),
 ]
+
+
+def _repair_trajectory_metadata(run_dir):
+    """Make RoboCasa reconfigure seeds replayable by ManiSkill's checker."""
+    path = Path(run_dir) / "trajectory.json"
+    if not path.exists():
+        return
+    data = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for episode in data.get("episodes", []):
+        seed = episode.get("reset_kwargs", {}).get("seed")
+        if isinstance(seed, list) and len(seed) == 1:
+            seed = seed[0]
+        if seed is not None and episode.get("episode_seed") != seed:
+            episode["episode_seed"] = int(seed)
+            changed = True
+    if changed:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def parse_args():
@@ -1208,5 +1230,6 @@ if __name__ == "__main__":
     with capture_stdout(env.dir / "console.log"):
         planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
+    _repair_trajectory_metadata(run_dir)
     if not args.no_video:
         print(f"[INFO] Video recording saved in '{run_dir}/'")
