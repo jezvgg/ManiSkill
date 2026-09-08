@@ -107,7 +107,7 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=20 "${REMOTE_HOST}" "${launch_cmd}";
   launched=0
   for _ in $(seq 1 12); do
     n=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${REMOTE_HOST}" \
-      "ps -eo args= | grep '[${JOB:0:1}]${JOB:1}' | grep '[p]lanners.${PLANNER_NAME}' | wc -l" 2>/dev/null) || {
+      "pgrep -fc '^/.*/python -m planners\\.${PLANNER_NAME} ' || true" 2>/dev/null) || {
         sleep 10
         continue
       }
@@ -131,7 +131,7 @@ zero_polls=0
 n=1
 while [ "$(date +%s)" -lt "$deadline" ]; do
   if n=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${REMOTE_HOST}" \
-    "ps -eo args= | grep '[${JOB:0:1}]${JOB:1}' | grep '[p]lanners.${PLANNER_NAME}' | wc -l" 2>/dev/null); then
+    "pgrep -fc '^/.*/python -m planners\\.${PLANNER_NAME} ' || true" 2>/dev/null); then
     if [ "${n}" -eq 0 ]; then
       zero_polls=$((zero_polls + 1))
       [ "${zero_polls}" -ge 3 ] && break

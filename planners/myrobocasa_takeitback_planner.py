@@ -1197,8 +1197,8 @@ if __name__ == "__main__":
     env = gym.make(
         "MyRoboCasa_TakeItBack-v1",
         num_envs=1,
-        render_mode=args.render_mode,
-        obs_mode="rgb",
+        render_mode=None if args.no_video else args.render_mode,
+        obs_mode="state" if args.no_video else "rgb",
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
         # the PhysX CPU solver's parallel contact ordering is non-deterministic
