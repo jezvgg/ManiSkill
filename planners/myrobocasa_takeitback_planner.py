@@ -12,6 +12,7 @@ from trimesh.primitives import Box
 
 from mani_skill.agents.robots import Fetch
 from mani_skill.envs.tasks import MyRoboCasaSceneTakeItBack
+from mani_skill.utils.wrappers import RecordEpisode
 from mani_skill.examples.motionplanning.fetch.extand import (
     FetchMotionPlanningSapienSolver,
 )
@@ -1192,6 +1193,15 @@ if __name__ == "__main__":
         print("[INFO] video recording disabled (--no-video)")
     else:
         env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
+    env = RecordEpisode(
+        env,
+        output_dir=str(run_dir),
+        trajectory_name="trajectory",
+        save_trajectory=True,
+        save_video=False,
+        source_type="motionplanning",
+        source_desc="TakeItBack Fetch motion-planning demonstration",
+    )
     env = PlannerLogger(env, log_dir=str(run_dir), name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
 
     env.action_space.seed(SEED)
