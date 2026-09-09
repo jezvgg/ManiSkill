@@ -15,11 +15,10 @@ from transforms3d.euler import euler2quat
 
 from mani_skill.agents.robots import Fetch
 from mani_skill.envs.tasks import MyRoboCasaFridgeVeggies
-from mani_skill.examples.motionplanning.fetch.extand import (
-    FetchMotionPlanningSapienSolver,
-)
+from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
 from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
 from utils.planners_utils import (
+    _base_cmd,
     lower_torso_smooth,
     lower_torso_until_rest,
 )
@@ -316,7 +315,9 @@ def _drive_base(
             he = float(np.arctan2(np.cross(xa, dt)[2], np.dot(xa, dt)))
             if abs(he) < np.deg2rad(align_deg):
                 break
-            base_action = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
+            base_action = _base_cmd(
+                yaw=float(np.clip(1.5 * he, -0.6, 0.6))
+            )
             env.step(np.hstack([arm_action, 1, body_action, base_action]))
         planner.planner.update_from_simulation()
 
@@ -386,7 +387,7 @@ def _yaw_base_to(env, planner, target_pos, max_rot=500, align_deg=3.0):
         he = float(np.arctan2(np.cross(xa, delta / dist)[2], np.dot(xa, delta / dist)))
         if abs(he) < np.deg2rad(align_deg):
             break
-        base_action = np.array([0.0, 0.0, float(np.clip(1.5 * he, -0.6, 0.6))])
+        base_action = _base_cmd(yaw=float(np.clip(1.5 * he, -0.6, 0.6)))
         env.step(np.hstack([arm_action, 1, body_action, base_action]))
     planner.planner.update_from_simulation()
 
@@ -1335,8 +1336,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         body_action[0] = body_action[1] = 0.0
         body_action[2] += 0.06  # torso UP (absolute target)
         for _ in range(30):
-            a = np.hstack([arm_action, planner.gripper_state, body_action,
-                           np.array([0.0, 0.0, 0.0])])
+            a = np.hstack(
+                [arm_action, planner.gripper_state, body_action, _base_cmd()]
+            )
             env.step(a)
         planner.planner.update_from_simulation()
         # the base-fixed plan descends via the TORSO (the IK keeps the arm
@@ -1422,8 +1424,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 break
             body_action[2] -= 0.02  # absolute torso target, small steps
             for _ in range(6):
-                a = np.hstack([arm_action, planner.gripper_state, body_action,
-                               np.array([0.0, 0.0, 0.0])])
+                a = np.hstack(
+                    [arm_action, planner.gripper_state, body_action, _base_cmd()]
+                )
                 env.step(a)
         planner.planner.update_from_simulation()
         # the torso alone cannot always press the vegetable onto the floor
@@ -1458,8 +1461,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         gs = float(planner.gripper_state)  # -1 while holding
         # pi-lens-ignore: unchecked-throwing-call-python
         for frac in np.linspace(0.0, 1.0, 20):
-            a = np.hstack([arm_action, gs + (0.6 - gs) * frac,
-                           body_action, np.array([0.0, 0.0, 0.0])])
+            a = np.hstack(
+                [arm_action, gs + (0.6 - gs) * frac, body_action, _base_cmd()]
+            )
             env.step(a)
         planner.gripper_state = 0.6
         _detach_object(planner)
@@ -1496,8 +1500,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         body_action[0] = body_action[1] = 0.0
         gs = float(planner.gripper_state)
         for frac in np.linspace(0.0, 1.0, 20):
-            a = np.hstack([arm_action, gs + (0.6 - gs) * frac,
-                           body_action, np.array([0.0, 0.0, 0.0])])
+            a = np.hstack(
+                [arm_action, gs + (0.6 - gs) * frac, body_action, _base_cmd()]
+            )
             env.step(a)
         planner.gripper_state = 0.6
         # pi-lens-ignore: unchecked-throwing-call-python
@@ -1584,7 +1589,7 @@ if __name__ == "__main__":
         num_envs=1,
         render_mode=None if args.no_video else args.render_mode,
         obs_mode="state" if args.no_video else "rgb",
-        robot_uids="ds_fetch",
+        robot_uids="ds_fetch_canonical",
         control_mode="pd_joint_pos",
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),
     )

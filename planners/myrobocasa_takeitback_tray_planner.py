@@ -12,9 +12,7 @@ import torch
 from mani_skill.agents.robots import Fetch
 from my_scenes.my_robocasa_takeitback_tray import MyRoboCasaSceneTakeItBackTray
 from mani_skill.utils.wrappers import RecordEpisode
-from mani_skill.examples.motionplanning.fetch.extand import (
-    FetchMotionPlanningSapienSolver,
-)
+from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
 from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
@@ -420,16 +418,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
         debug=debug,
     )
 
-    # The upstream executor asserts position-mode even though it only builds
-    # absolute arm targets. Keep its planner-side mode compatible; the real
-    # env controller remains pd_joint_delta_pos and receives converted deltas.
+    # mplib emits absolute arm targets. Convert only those seven slots to raw
+    # joint deltas; remaining canonical action layout stays unchanged.
     planner.control_mode = "pd_joint_pos"
-    agent.controller.controllers["arm"]._normalize_action = False
     _step_absolute = env.step
 
     def _step_delta(action):
         action = np.asarray(action)
-        if action.shape == (14,):
+        if action.shape == (13,):
             action = action.copy()
             arm_qpos = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
             action[:7] -= arm_qpos
@@ -449,8 +445,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # STRAIGHT-ARM GEOMETRY: the arm stays in the home (straight) config for
     # the WHOLE task. The TCP rides at (1.128, 0, 0.786 + torso) in the base
     # frame (measured), so the cup offset from the base is constant and all
-    # horizontal positioning is done with the base (forward/backward =
-    # north/south, sideways = east/west), the vertical with the torso only.
+    # horizontal positioning uses turn-then-forward base motion; vertical
+    # positioning uses the torso only.
     # The robot rotates ONCE to face north (the arm into the counter) with
     # the empty gripper, then never rotates again. No arm reconfiguration,
     # no mplib arm motions, no sharp moves: every stage is a smooth scripted
@@ -473,7 +469,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         return getattr(agent.controller, "controllers")["body"].qpos[0].cpu().numpy().copy()
 
     def step_hold(torso_target=None):
-        a = np.zeros(14)
+        a = np.zeros(13)
         a[:7] = hold_a()
         a[7] = planner.gripper_state
         b = hold_b()
@@ -572,7 +568,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 # steps when a held cup cannot reach the surface.
                 break
             b[2] -= 0.005
-            a = np.zeros(14)
+            a = np.zeros(13)
             a[:7] = hold_a()
             a[7] = planner.gripper_state
             a[8:11] = b
@@ -629,7 +625,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     report_stage("0 raise+align+bend")
 
     # ------------------------------------------------------------------ #
-    # STAGE 1: drive sideways (east-west, along the counter) to the cup's x
+    # STAGE 1: turn and drive along the counter to the cup's x
     # at the safe south line (y = cup_y - ARM_OFFSET - 0.4), then STAGE 2:
     # lower the torso to the grasp height and drive to the PRE-GRASP along a
     # SAFE corridor. The jaws' plates span +-6.45 cm from the gripper, so any
@@ -1072,7 +1068,7 @@ if __name__ == "__main__":
         num_envs=1,
         render_mode=None if args.no_video else args.render_mode,
         obs_mode="state" if args.no_video else "rgb",
-        robot_uids="ds_fetch",
+        robot_uids="ds_fetch_canonical",
         control_mode="pd_joint_delta_pos",
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),
     )

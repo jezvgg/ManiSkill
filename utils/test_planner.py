@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
 
     planning_fn = load_planner(args.planner)
-    env = gym.make(args.scene, render_mode=args.render_mode, obs_mode="rgb", robot_uids="ds_fetch", control_mode="pd_joint_pos")
+    env = gym.make(args.scene, render_mode=args.render_mode, obs_mode="rgb", robot_uids="ds_fetch_canonical", control_mode="pd_joint_pos")
 
     all_frames, successes = [], []
 
