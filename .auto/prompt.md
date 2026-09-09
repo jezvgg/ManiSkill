@@ -2,19 +2,19 @@
 
 ## Objective
 
-Improve `myrobocasa_takeitback_planner` until all 50 evaluation seeds succeed (`50/50`). The task moves the cup from its counter position onto the tray, regrips it, and returns it to the original counter position. Prefer a better geometric strategy (reachable poses, approach corridor, base/arm/torso configuration, and transport geometry) over piles of seed-specific retries or small threshold tweaks. Do not overfit to the current seed batch and do not alter the task/evaluation to fake success.
+Improve `myrobocasa_takeitback_planner` until all 100 evaluation seeds succeed (`100/100`). The task moves the cup from its counter position onto the tray, regrips it, and returns it to the original counter position. Prefer a better geometric strategy (reachable poses, approach corridor, base/arm/torso configuration, and transport geometry) over piles of seed-specific retries or small threshold tweaks. Do not overfit to the current seed batch and do not alter the task/evaluation to fake success.
 
 ## Metrics
 
-- **Primary**: `successes` (count, higher is better), from 50 seeds run remotely with 10 workers.
+- **Primary**: `successes` (count, higher is better), from 100 seeds run remotely with 25 workers.
 - **Secondary**: `completed` terminal result logs, `stage3`, `stage5`, `stage12`, `missing`.
 
 ## How to Run
 
 `./.auto/measure.sh` runs the prescribed remote benchmark:
-`NO_VIDEO=1 bash skills/maniskill-remote-planner-analysis/scripts/remote_analyze.sh myrobocasa_takeitback_planner 50 10`
+`NO_VIDEO=1 SEED_COUNT=100 WORKERS=25 PLANNER_NAME=myrobocasa_takeitback_planner LOG_PREFIX=takeitback bash .auto/measure.sh`
 
-The script clears local generated `logs/`, runs seeds 1..50, and emits `METRIC name=value` lines. A result counts only when that seed's terminal event has `success: true`; missing or abruptly terminated runs do not count as success.
+The script clears local generated `logs/`, runs seeds 1..100, and emits `METRIC name=value` lines. A result counts only when that seed's terminal event has `success: true`; missing or abruptly terminated runs do not count as success.
 
 ## Files in Scope
 
@@ -38,7 +38,7 @@ Read-only context:
 
 - Use `uv` for Python/package execution; no dependency additions.
 - Keep planner deterministic for a given seed where possible.
-- Every code change must be tested by the 50-seed metric before keeping it.
+- Every code change must be tested by the 100-seed metric at 25 workers before keeping it.
 - Favor one coherent geometric plan over local patches. Simplify/remove contradictory old paths when replacing them.
 - If a benchmark is incomplete, diagnose measurement/runner integrity separately; do not tune planner against missing data.
 
@@ -58,4 +58,4 @@ The current planner is over-constrained by a fixed straight-arm configuration, p
 
 These mechanisms are useful diagnostics, but the benchmark evidence points to a geometric redesign rather than more attempts at the same pose. Update this section after each meaningful experiment with the result and the general lesson, including discarded ideas.
 
-Latest experiments: 10 workers produced a complete 36/50 baseline. A 65-degree pan redesign collapsed to 12/50 and was discarded. A fixed-arm screw transport route reached 42/50; fixed-arm screw staging plus live pre-grasp parking reached 45/50; live front-facing initial fallback reached 38/50 when tested alone. Closing from the release pose and validating an immediate vertical lift reached 48/50, then skipping the redundant Stage 9 lift check after that verified lift reached 50/50. Independent confirmation also reached 50/50 with 10 workers; target is met.
+Latest nonholonomic TakeItBack experiments: e4 turn-drive-turn control reached 96/100 at 25 workers. Full Stage12 opening regressed to 95/100. Closed-gripper 12-step settling before initial/tray lifts improved to 97/100 and is kept. Low-torso recovery and pre-grasp arm reset regressed and were discarded. Remaining failures span initial grasp/lift, tray transport/regrasp, and final release; do not tune individual seeds. User requires global geometry, 100 seeds, 25 workers.

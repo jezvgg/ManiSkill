@@ -522,14 +522,19 @@ def planning(env, seed, debug=False, vis=None, info=False):
         )
 
     def l_drive(aim_xy, tol=0.04):
-        """Move held cup with fixed-arm screw segments and a 5 cm detour."""
+        """Use one straight payload leg; keep L corridor for empty approach."""
         aim = np.asarray(aim_xy, dtype=float)
         base = agent.base_link.pose.p[0].cpu().numpy()
-        targets = (
-            np.array([base[0], aim[1] + 0.05, 0.0]),
-            np.array([aim[0], aim[1] + 0.05, 0.0]),
-            np.array([aim[0], aim[1], 0.0]),
-        )
+        if cup_held():
+            # A held cup should cross the transfer in one orbit rather than
+            # sweeping around the base at every L-corner.
+            targets = (np.array([aim[0], aim[1], 0.0]),)
+        else:
+            targets = (
+                np.array([base[0], aim[1] + 0.05, 0.0]),
+                np.array([aim[0], aim[1] + 0.05, 0.0]),
+                np.array([aim[0], aim[1], 0.0]),
+            )
         for target in targets:
             current = agent.base_link.pose.p[0].cpu().numpy()
             if np.linalg.norm(target[:2] - current[:2]) <= tol:
