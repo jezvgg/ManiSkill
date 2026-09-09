@@ -493,6 +493,12 @@ def planning(env, seed, debug=False, vis=None, info=False):
             env.step(np.hstack([arm, planner.gripper_state, hold_b(), _base_cmd()]))
         _sync()
 
+    def settle_gripper(steps=12):
+        """Let a closed contact settle before testing or lifting it."""
+        for _ in range(steps):
+            step_hold()
+        _sync()
+
     def descend_to_grasp(target_pose, xy_tol=0.05):
         """Use torso for final vertical closure when arm IK stalls."""
         target = np.asarray(target_pose.p, dtype=float)
@@ -747,7 +753,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 aligned = descend_to_grasp(live_final)
             if aligned:
                 planner.close_gripper()
-                _sync()
+                settle_gripper()
                 if cup_held():
                     got = True
                     break
@@ -1000,7 +1006,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # pi-lens-ignore: unchecked-throwing-call-python
     cup_z_before_regrasp = float(unwenv.cup.pose.p[0][2])
     planner.close_gripper()
-    _sync()
+    settle_gripper()
     if cup_held():
         tcp8 = agent.tcp.pose.p[0].cpu().numpy()
         q8 = agent.tcp.pose.q[0].cpu().numpy()
