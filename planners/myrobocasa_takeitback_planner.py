@@ -430,6 +430,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # absolute arm targets. Keep its planner-side mode compatible; the real
     # env controller remains pd_joint_delta_pos and receives converted deltas.
     planner.control_mode = "pd_joint_pos"
+    agent.controller.controllers["arm"]._normalize_action = False
     _step_absolute = env.step
 
     def _step_delta(action):
