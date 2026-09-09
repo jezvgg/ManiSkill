@@ -426,6 +426,22 @@ def planning(env, seed, debug=False, vis=None, info=False):
         debug=debug,
     )
 
+    # The upstream executor asserts position-mode even though it only builds
+    # absolute arm targets. Keep its planner-side mode compatible; the real
+    # env controller remains pd_joint_delta_pos and receives converted deltas.
+    planner.control_mode = "pd_joint_pos"
+    _step_absolute = env.step
+
+    def _step_delta(action):
+        action = np.asarray(action)
+        if action.shape == (14,):
+            action = action.copy()
+            arm_qpos = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+            action[:7] -= arm_qpos
+        return _step_absolute(action)
+
+    env.step = _step_delta
+
     def _sync():
         getattr(planner.planner, "update_from_simulation")()
     env.track_object(unwenv.cup, "cup")
@@ -1215,7 +1231,7 @@ if __name__ == "__main__":
         render_mode=None if args.no_video else args.render_mode,
         obs_mode="state" if args.no_video else "rgb",
         robot_uids="ds_fetch",
-        control_mode="pd_joint_pos",
+        control_mode="pd_joint_delta_pos",
         # the PhysX CPU solver's parallel contact ordering is non-deterministic
         # by default (two runs of the same seed diverged by 0.0001 m at the
         # approach, amplified by the closed-loop base drives into different
