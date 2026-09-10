@@ -250,10 +250,9 @@ class MyRoboCasaSceneTakeItBackTray(BaseRoboCasaSimple):
 
     @property
     def _default_sensor_configs(self):
-        pose = sapien_utils.look_at(self.camera_pos, self.counter_pos)
-        return [
-            CameraConfig("base_camera", pose, 128, 128, 60 * np.pi / 180, 0.01, 100)
-        ]
+        # trajectory collection records robot-mounted cameras only; the
+        # external counter-viewing base_camera is dropped for trajectory weight
+        return []
 
     @property
     def _default_human_render_camera_configs(self):

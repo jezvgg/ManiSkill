@@ -16,7 +16,7 @@ from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
 from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
-from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
+from utils.logging_utils import PlannerLogger, capture_stdout
 from utils.planners_utils import (
     _rotate_base_to,
     _screw_base_translate,
@@ -1072,10 +1072,12 @@ if __name__ == "__main__":
         control_mode="pd_joint_delta_pos",
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),
     )
+    # mp4 side-videos from the three EXTERNAL scene cameras are NOT recorded:
+    # trajectory weight. The h5 keeps RGB observations from the robot-mounted
+    # cameras (obs_mode="rgb"), which is what the LeRobot converter encodes
+    # into per-camera videos.
     if args.no_video:
         print("[INFO] video recording disabled (--no-video)")
-    else:
-        env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
     env = RecordEpisode(
         env,
         output_dir=str(run_dir),
