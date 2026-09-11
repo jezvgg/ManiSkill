@@ -1,79 +1,7 @@
 import numpy as np
 import mplib
 
-from mani_skill.examples.motionplanning.fetch.extand import (
-    FetchMotionPlanningSapienSolver,
-)
-
-
-# persistent cmd->world map estimate for the holonomic base drive: a robot
-# property (slowly varying with config), shared across all drive calls so the
-# transport's repeated segment fallbacks do not re-calibrate from scratch
-# persistent EGO-frame cmd->world map (per unit command per step, resolved
-# at heading 0): a robot property, invariant to the base's current heading.
-# At each drive call it is rotated into the world frame by the current yaw,
-# so heading changes between calls (or the screw planner's own turns) do not
-# stale the estimate. It is CALIBRATED by measuring the response to commands
-# along the ego axes (no model guessing); recalibrated whenever the heading
-# moves more than 25 deg from the heading it was measured at.
-_BASE_MAP_EGO = None
-_CAL_HEADING = None
-_BASE_MAP_DET = None
-
-def _base_cmd(vx=0.0, w=0.0):
-    """Fetch base command: [forward_velocity, 0 lateral, yaw_velocity]."""
-    return np.array([vx, 0.0, w])
-
-
-def _follow_moving_forward(self, result, refine_steps=0):
-    """Old Fetch executor: project planned XY velocity onto forward axis."""
-    n_step = result["position"].shape[0]
-    root_to_world = self.env_agent.robot.root_pose.sp.to_transformation_matrix()[:3, :3]
-    base_direction = self.env_agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
-    for i in range(n_step + refine_steps):
-        arm_action = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-        body_action = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
-        body_action[0] = body_action[1] = 0.0
-        qvel = result["velocity"][min(i, n_step - 1)]
-        world_velocity = root_to_world @ np.array([qvel[0], qvel[1], 0.0])
-        base_action = _base_cmd(float(np.dot(world_velocity, base_direction)))
-        obs, reward, terminated, truncated, info = self.env.step(
-            np.hstack([arm_action, self.gripper_state, body_action, base_action])
-        )
-        self.elapsed_steps += 1
-        if self.print_env_info:
-            print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
-        if self.vis:
-            self.base_env.render_human()
-    return obs, reward, terminated, truncated, info
-
-
-_legacy_follow_path = FetchMotionPlanningSapienSolver.follow_forward_path_w_refinement
-
-
-def _follow_forward_path_w_refinement(self, result, refine=False, static=False):
-    """Run old arm-path executor while projecting its base action to forward."""
-    original_step = self.env.step
-
-    def step(action):
-        action = np.asarray(action)
-        if action.shape == (14,):
-            agent = self.env.unwrapped.agent
-            matrix = agent.base_link.pose.sp.to_transformation_matrix()
-            world_velocity = matrix[:2, :2] @ action[-3:-1]
-            forward = float(np.dot(world_velocity, matrix[:2, 0]))
-            action = np.hstack([action[:-3], [forward, 0.0, action[-1]]])
-        return original_step(action)
-
-    self.env.step = step
-    try:
-        return _legacy_follow_path(self, result, refine, static)
-    finally:
-        self.env.step = original_step
-
-
-FetchMotionPlanningSapienSolver.follow_moving_forward = _follow_moving_forward
-FetchMotionPlanningSapienSolver.follow_forward_path_w_refinement = _follow_forward_path_w_refinement
+from utils.canonical_fetch import _base_cmd
 
 
 def lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=False, arm_action=None, gripper_action=None):
@@ -153,7 +81,7 @@ def move_base_backward_smooth(env, planner, target_base_pos, max_steps=200, eps=
 
         rem_dist = float(np.dot(back_delta_world, cur_base_dir))
         vel = np.clip(rem_dist * 2.5, -0.6, 0.6)
-        base_action = np.array([vel, 0.0, 0.0])
+        base_action = _base_cmd(vel)
 
         action = np.hstack([arm_action, gripper_action, body_action, base_action])
         env.step(action)
@@ -227,7 +155,7 @@ def _rotate_base_to(env, planner, dir_world, max_rot=300, rot_gain=1.2,
             for _ in range(30):
                 env.step(np.hstack([arm_action, gripper_action, body_action, _base_cmd()]))
             return
-        ba = _base_cmd(w=float(np.clip(rot_gain * he, -rot_cap, rot_cap)))
+        ba = _base_cmd(yaw=float(np.clip(rot_gain * he, -rot_cap, rot_cap)))
         env.step(np.hstack([arm_action, gripper_action, body_action, ba]))
     planner.planner.update_from_simulation()
 
@@ -314,7 +242,7 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
             # fixtures fling the base - verified: seed 17 flew 3+ m south)
             for _ in range(12):
                 env.step(np.hstack([arm_action, gripper_action, body_action,
-                                    _base_cmd(w=0.08)]))
+                                    _base_cmd(yaw=0.08)]))
             for _ in range(30):
                 env.step(np.hstack([arm_action, gripper_action, body_action,
                                     _base_cmd()]))
@@ -568,7 +496,7 @@ def _yaw_sweep_with_pass_check(env, planner, bearing, plate_center, *,
             return False
         va = float(np.clip(0.9 * e, -rot_cap, rot_cap))
         env.step(np.hstack([arm_action, gripper_action, body_action,
-                            _base_cmd(w=va)]))
+                            _base_cmd(yaw=va)]))
     return False
 
 
@@ -668,7 +596,7 @@ def _prop_forward_transport(env, planner, plate_center, *,
             # far and misaligned: gentle yaw toward the bearing
             va = float(np.clip(1.5 * alpha, -0.22, 0.22))
             env.step(np.hstack([arm_action, gripper_action, body_action,
-                                _base_cmd(w=va)]))
+                                _base_cmd(yaw=va)]))
         elif dist > 0.30:
             # aligned: slow proportional forward burst toward the plate
             for _ in range(fwd_steps):
@@ -680,14 +608,21 @@ def _prop_forward_transport(env, planner, plate_center, *,
                 vel = float(np.clip(k_gain * fwd_left, -v_max, v_max))
                 if abs(vel) < 0.02:
                     break
-                env.step(np.hstack([arm_action, gripper_action, body_action,
-                                    np.array([-vel if backward else vel,
-                                              0.0, 0.0])]))
+                env.step(
+                    np.hstack(
+                        [
+                            arm_action,
+                            gripper_action,
+                            body_action,
+                            _base_cmd(-vel if backward else vel),
+                        ]
+                    )
+                )
         else:
             # near: pure gentle yaw - the veg rides its orbit onto the plate
             va = float(np.clip(1.5 * alpha, -0.18, 0.18))
             env.step(np.hstack([arm_action, gripper_action, body_action,
-                                _base_cmd(w=va)]))
+                                _base_cmd(yaw=va)]))
         planner.planner.update_from_simulation()
 
         obj_now = _current_object_pos(env, planner)
@@ -757,9 +692,8 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos,
     # 2) rotate in place toward the transfer direction, sweeping the held
     #    object on its orbit: if the sweep carries it over the plate, stop
     #    immediately (the caller lowers and releases without further driving)
-    #    yaw_sweep=False skips these rotations: the holonomic base controller
-    #    translates in any direction directly, and every base rotation swings
-    #    the held vegetable (inertia pulls it out of the fingers - observed
+    #    yaw_sweep=False skips these rotations; every base rotation swings the
+    #    held vegetable (inertia pulls it out of the fingers - observed
     #    mid-transport drops).
     if yaw_sweep and _yaw_sweep_with_pass_check(env, planner, dir_world, target_obj_pos):
         planner.planner.update_from_simulation()
@@ -801,8 +735,7 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos,
         # drive the base along the remaining object direction (the held object
         # is rigid in the base frame); the screw translates reliably when the
         # heading is aligned, the axis velocity drive is the fallback. The
-        # base's lateral motion is unreliable (controller-frame quirk), so the
-        # waypoint is clamped to stay south of the counter front (front face at
+        # Clamp the waypoint south of the counter front (front face at
         # y=-0.65 minus the ~0.35 m base radius) or the base wedges into it.
         waypoint = base_p + rem / rem_dist * min(rem_dist, 0.5)
         # the mplib screw fails EXACTLY on pure -x motions: perturb the

@@ -11,9 +11,7 @@ from trimesh.primitives import Box
 
 from mani_skill.agents.robots import Fetch
 from mani_skill.envs.tasks import MyRoboCasaScene
-from mani_skill.examples.motionplanning.fetch.extand import (
-    FetchMotionPlanningSapienSolver,
-)
+from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
 from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
@@ -211,7 +209,7 @@ if __name__ == "__main__":
         "MyRoboCasa-v1",
         num_envs=1,
         render_mode=args.render_mode,
-        robot_uids="ds_fetch",
+        robot_uids="ds_fetch_canonical",
         control_mode="pd_joint_pos",
     )
     # Video-only recording: frames stream straight into ffmpeg, so RAM stays at

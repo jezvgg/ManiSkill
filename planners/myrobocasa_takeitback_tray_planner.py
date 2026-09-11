@@ -9,23 +9,18 @@ import gymnasium as gym
 import numpy as np
 import sapien
 import torch
-from trimesh.primitives import Box
-
 from mani_skill.agents.robots import Fetch
-from mani_skill.envs.tasks import MyRoboCasaSceneTakeItBack
+from my_scenes.my_robocasa_takeitback_tray import MyRoboCasaSceneTakeItBackTray
 from mani_skill.utils.wrappers import RecordEpisode
 from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
 from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
-from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
+from utils.logging_utils import PlannerLogger, capture_stdout
 from utils.planners_utils import (
     _rotate_base_to,
     _screw_base_translate,
     _velocity_segment,
-    lower_torso_smooth,
-    retract_arm_lift_torso,
-    drive_base_to_position,
     _base_cmd,
 )
 
@@ -81,7 +76,7 @@ def _repair_trajectory_metadata(run_dir):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Motion planner for MyRoboCasa_TakeItBack-v1 scene")
+    parser = argparse.ArgumentParser(description="Motion planner for MyRoboCasa_TakeItBackTray-v1 scene")
     parser.add_argument("--seed", type=int, default=3, help="Random seed (default: 3)")
     parser.add_argument("--render-mode", type=str, default="rgb_array",
                         choices=["rgb_array", "human", "sensors"],
@@ -409,12 +404,11 @@ def _transport_cup(env, planner, agent, aim_xy, arm_action, body_action,
 def planning(env, seed, debug=False, vis=None, info=False):
     vis = vis or env.unwrapped.render_mode == "human"
 
-    unwenv: MyRoboCasaSceneTakeItBack = env.unwrapped
+    unwenv: MyRoboCasaSceneTakeItBackTray = env.unwrapped
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
     agent: Fetch = cast(Fetch, unwenv.agent)  # captured after reconfigure reset
 
     tray_center = unwenv.tray.pose.p[0].cpu().numpy()
-    init_cup = unwenv.cup_pos[0]
 
     planner = FetchMotionPlanningSapienSolver(
         env,
@@ -779,23 +773,22 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 _sync()
         return got
 
-    def verify_load_bearing_grasp(lift=0.08, min_rise=0.04, restore=False):
-        """Reject a fallback contact that cannot carry a slow intermediate lift."""
+    def verify_load_bearing_grasp():
+        """Reject contact that closes around the cup but cannot lift it."""
         if not cup_held() or tcp_cup_gap() > 0.08:
             return False
         torso_z = float(hold_b()[2])
         cup_z = float(unwenv.cup.pose.p[0][2])
-        ramp_torso(torso_z + lift, steps=80)
+        ramp_torso(torso_z + 0.04, steps=40)
         valid = (
             cup_held()
-            and float(unwenv.cup.pose.p[0][2]) >= cup_z + min_rise
+            and float(unwenv.cup.pose.p[0][2]) >= cup_z + 0.015
             and tcp_cup_gap() <= 0.12
         )
-        if not valid or restore:
-            ramp_torso(torso_z, steps=80)
+        ramp_torso(torso_z, steps=40)
         return valid and cup_held() and tcp_cup_gap() <= 0.12
 
-    def fallback_grasp(load_test=False):
+    def fallback_grasp():
         # drive the base closer (arm HIGH - the mid-grasp low-torso drive near
         # the counter fails to move the base) so the cup is inside the
         # workspace, then re-run the arm align. Returns True only after a
@@ -826,22 +819,18 @@ def planning(env, seed, debug=False, vis=None, info=False):
         for _ in range(3):
             planner.close_gripper()
             settle_gripper()
-            _sync()
-            if cup_held() and tcp_cup_gap() <= 0.08:
-                if not load_test or verify_load_bearing_grasp():
-                    return True
+            if verify_load_bearing_grasp():
+                return True
             planner.open_gripper()
             _sync()
-        if not load_test:
-            return run_grasp()
-        if run_grasp() and verify_load_bearing_grasp():
-            return True
-        if cup_held():
+        if run_grasp():
+            if verify_load_bearing_grasp():
+                return True
             planner.open_gripper()
             _sync()
-        if alternate_grasp() and verify_load_bearing_grasp():
-            return True
-        if cup_held():
+        if alternate_grasp():
+            if verify_load_bearing_grasp():
+                return True
             planner.open_gripper()
             _sync()
         return False
@@ -927,7 +916,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # (drive base closer + re-run the align) and retry the lift once.
         env.log_event("phase", "Stage 4: re-grasp (lift detect)")
         ramp_torso(TORSO_GRASP, steps=80)
-        if fallback_grasp(load_test=True):
+        if fallback_grasp():
             # pi-lens-ignore: unchecked-throwing-call-python
             cup_z0 = float(unwenv.cup.pose.p[0][2])
             ramp_torso(TORSO_TRANSPORT, steps=150)
@@ -1043,187 +1032,13 @@ def planning(env, seed, debug=False, vis=None, info=False):
     unwenv.evaluate()
     report_stage("7 released")
 
-    # ------------------------------------------------------------------ #
-    # STAGE 8: regrasp - close the jaws (no motion), verify. The cup is
-    # still between the jaws (partial open), so the close always catches it.
-    # ------------------------------------------------------------------ #
-    env.log_event("phase", "Stage 8: regrasp")
-    # Close at release pose first. If contact is real, a short lift test
-    # proves the cup is supported before any re-localization can disturb it.
-    got8 = False
-    lifted_from_tray = False
-    # pi-lens-ignore: unchecked-throwing-call-python
-    cup_z_before_regrasp = float(unwenv.cup.pose.p[0][2])
-    planner.close_gripper()
-    settle_gripper()
-    if cup_held():
-        tcp8 = agent.tcp.pose.p[0].cpu().numpy()
-        q8 = agent.tcp.pose.q[0].cpu().numpy()
-        lift8 = sapien.Pose(p=tcp8 + np.array([0.0, 0.0, 0.07]), q=q8)
-        r8 = env.log_motion(
-            "Stage 8 lift test", planner.static_manipulation, lift8,
-            n_init_qpos=100, disable_lift_joint=False,
-        )
-        _sync()
-        # pi-lens-ignore: unchecked-throwing-call-python
-        lifted_from_tray = (
-            r8 != -1
-            # pi-lens-ignore: unchecked-throwing-call-python
-            and float(unwenv.cup.pose.p[0][2]) >= cup_z_before_regrasp + 0.05
-            and tcp_cup_gap() <= 0.12
-        )
-        got8 = lifted_from_tray
-        if not got8:
-            planner.open_gripper()
-            _sync()
-
-    if not got8:
-        # Re-localize only after the in-place lift test fails.
-        ramp_torso(TORSO_GRASP, steps=100)
-        for _a in range(3):
-            planner.close_gripper()
-            _sync()
-            if cup_held():
-                got8 = True
-                break
-            planner.open_gripper()
-            _sync()
-            cc8 = unwenv.cup.pose.p[0].cpu().numpy()
-            q8 = agent.tcp.pose.q[0].cpu().numpy()
-            fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
-            int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
-            r1 = env.log_motion(
-                "Stage 8 align", planner.static_manipulation, int8,
-                n_init_qpos=100, disable_lift_joint=False,
-            )
-            _sync()
-            r2 = -1 if r1 == -1 else env.log_motion(
-                "Stage 8 align", planner.static_manipulation, fin8,
-                n_init_qpos=100, disable_lift_joint=False,
-            )
-            _sync()
-    if not got8:
-        print("Regrasp failed; aborting")
-        env.log_event("error", "Regrasp failed")
-        success = bool(unwenv.evaluate()["success"].item())
-        env.log_event("result", "Task aborted", success=success)
-        env.reset()
-        return success
-    report_stage("8 regrasped")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 9: lift from the tray, unless Stage 8 already proved attachment.
-    # ------------------------------------------------------------------ #
-    env.log_event("phase", "Stage 9: lift from tray")
-    if lifted_from_tray:
-        # The lift test already cleared the tray; a second lift adds no signal
-        # and can turn a supported contact into a slip.
-        # pi-lens-ignore: unchecked-throwing-call-python
-        cz = float(unwenv.cup.pose.p[0][2])
-        if tcp_cup_gap() > 0.12:
-            print(f"Lift from tray failed (cup gap {tcp_cup_gap():.3f}); aborting")
-            env.log_event("error", "Lift from tray failed")
-            success = bool(unwenv.evaluate()["success"].item())
-            env.log_event("result", "Task aborted", success=success)
-            env.reset()
-            return success
-    else:
-        # pi-lens-ignore: unchecked-throwing-call-python
-        cup_z0 = float(unwenv.cup.pose.p[0][2])
-        ramp_torso(TORSO_TRANSPORT, steps=150)
-        # pi-lens-ignore: unchecked-throwing-call-python
-        cz = float(unwenv.cup.pose.p[0][2])
-        if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
-            print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
-            env.log_event("error", "Lift from tray failed")
-            success = bool(unwenv.evaluate()["success"].item())
-            env.log_event("result", "Task aborted", success=success)
-            env.reset()
-            return success
-    if lifted_from_tray:
-        # Stage 8 lift used arm IK; raise torso before base return so bent
-        # forearm clears the fixture stack.
-        ramp_torso(TORSO_TRANSPORT, steps=150)
-    report_stage("9 lifted from tray")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 10: return - back up, then the L-drive to the initial cup spot
-    # (init_cup_x, init_cup_y - ARM_OFFSET): the cup over its start point.
-    # ------------------------------------------------------------------ #
-    env.log_event("phase", "Stage 10: drive back to initial spot")
-    b = agent.base_link.pose.p[0].cpu().numpy()
-    res = env.log_motion("Stage 10 back up", drive_to,
-                         np.array([b[0], b[1] - 0.15, 0.0]), 0.10, 0.01)
-    if res != 0 or tcp_cup_gap() > 0.15:
-        print("Stage 10 back-up failed / cup lost; aborting")
-        env.log_event("error", "Stage 10 back-up failed")
-        success = bool(unwenv.evaluate()["success"].item())
-        env.log_event("result", "Task aborted", success=success)
-        env.reset()
-        return success
-    _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
-    aim_init = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
-    res = env.log_motion("Stage 10 drive to initial", l_drive, aim_init, 0.10)
-    for _c in range(2):
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-        if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - init_cup[:2])) <= 0.06:
-            break
-        _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
-        _aim2 = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
-        res = env.log_motion("Stage 10 correction", l_drive, _aim2, 0.10)
-        _sync()
-    if res != 0 or tcp_cup_gap() > 0.15:
-        print("Stage 10 drive to initial failed / cup lost; aborting")
-        env.log_event("error", "Stage 10 drive to initial failed")
-        success = bool(unwenv.evaluate()["success"].item())
-        env.log_event("result", "Task aborted", success=success)
-        env.reset()
-        return success
-    report_stage("10 at initial spot")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 11: place on the counter - lower slowly until the cup rests.
-    # ------------------------------------------------------------------ #
-    env.log_event("phase", "Stage 11: lower onto counter")
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-    counter_top = float(unwenv.counter_pos[2] + unwenv.counter_size[2] / 2)
-    lower_torso_until_cup_rests(counter_top)
-    report_stage("11 on counter")
-
-    # ------------------------------------------------------------------ #
-    # STAGE 12: release - full open (no motion), let the cup settle.
-    # ------------------------------------------------------------------ #
-    env.log_event("phase", "Stage 12: release")
-    # vertical release (same as the tray release): open the jaws, lift the
-    # torso - the plates rise off the cup, the cup stays put and quiet
-    for _i in range(30):
-        _frac = (_i + 1) / 30
-        planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)  # pyright: ignore[reportArgumentType]
-    _sync()
-    for _ in range(2500):
-        env.step(np.hstack([hold_a(), planner.gripper_state, hold_b(), _base_cmd()]))
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-        if (float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]) <= 0.1
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-                and float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]) <= 0.2):
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-            break
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-    _av12 = float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0])
-    print(f"[INFO] stage 12 settle done, cup av={_av12:.3f} rad/s")
-    report_stage("12 released")
-
     print("Task completed. Closing env...")
     ev = unwenv.evaluate()
     success = bool(ev["success"].item())
     print("Success:", success,
-          "| placed_on_tray:", bool(unwenv.placed_on_tray.item()),
           "| cup xy:", np.round(unwenv.cup.pose.p[0].cpu().numpy()[:2], 3),
-          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "z:", round(float(unwenv.cup.pose.p[0][2]), 3),
-          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "| v:", round(float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]), 4),
-          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "av:", round(float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]), 4))
     env.log_event("result", "Task completed", success=success)
     env.reset()
@@ -1235,11 +1050,6 @@ if __name__ == "__main__":
     SEED = args.seed
     random.seed(SEED)
     np.random.seed(SEED)
-    # the mplib IK/RRT samples random initial configurations from an
-    # UNSEEDED C++ RNG (verified: two runs of the same seed diverged at the
-    # reach phase - the "IK results" candidates differed -> different arm
-    # paths -> different outcomes = the batch "seed flips"). Seed it so the
-    # same run seed reproduces exactly.
     from mplib.pymp import set_global_seed
     set_global_seed(SEED)
     torch.manual_seed(SEED)
@@ -1249,31 +1059,25 @@ if __name__ == "__main__":
     print(f"[INFO] seed={SEED}, render_mode='{args.render_mode}', "
           f"debug={args.debug}, info={args.info}, log_dir='{args.log_dir}'")
 
-    run_id = f"takeitback_seed{SEED}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id = f"takeitback_tray_seed{SEED}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.log_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     env = gym.make(
-        "MyRoboCasa_TakeItBack-v1",
+        "MyRoboCasa_TakeItBackTray-v1",
         num_envs=1,
         render_mode=None if args.no_video else args.render_mode,
         obs_mode="state" if args.no_video else "rgb",
         robot_uids="ds_fetch_canonical",
         control_mode="pd_joint_delta_pos",
-        # the PhysX CPU solver's parallel contact ordering is non-deterministic
-        # by default (two runs of the same seed diverged by 0.0001 m at the
-        # approach, amplified by the closed-loop base drives into different
-        # reach inputs -> the "seed flips" between batches). eENHANCED_DETERMINISM
-        # pins the pair processing order so the same seed reproduces exactly.
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),
     )
-    # Video-only recording: frames stream straight into ffmpeg, so RAM stays at
-    # a single frame instead of RecordEpisode's whole-episode frame buffer
-    # (~12 GB at the 2048x2048 render resolution).
+    # mp4 side-videos from the three EXTERNAL scene cameras are NOT recorded:
+    # trajectory weight. The h5 keeps RGB observations from the robot-mounted
+    # cameras (obs_mode="rgb"), which is what the LeRobot converter encodes
+    # into per-camera videos.
     if args.no_video:
         print("[INFO] video recording disabled (--no-video)")
-    else:
-        env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
     env = RecordEpisode(
         env,
         output_dir=str(run_dir),
@@ -1281,9 +1085,15 @@ if __name__ == "__main__":
         save_trajectory=True,
         save_video=False,
         source_type="motionplanning",
-        source_desc="TakeItBack Fetch motion-planning demonstration",
+        source_desc="TakeItBack tray Fetch motion-planning demonstration",
     )
-    env = PlannerLogger(env, log_dir=str(run_dir), name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
+    env = PlannerLogger(
+        env,
+        log_dir=str(run_dir),
+        name=f"takeitback_tray_seed{SEED}",
+        log_freq=args.log_freq,
+        run_dir=run_dir,
+    )
 
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):

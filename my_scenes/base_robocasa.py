@@ -7,7 +7,7 @@ from mani_skill.utils.structs import Pose
 from utils.scene_utils import degree_to_quanterion
 
 class BaseRoboCasaScene(BaseEnv):
-    SUPPORTED_ROBOTS = ["fetch", "none"]
+    SUPPORTED_ROBOTS = ["fetch", "ds_fetch_canonical", "none"]
     SUPPORTED_REWARD_MODES = ["none"]
     FIXTURE_SEED: int = None
 
