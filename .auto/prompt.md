@@ -6,15 +6,15 @@ Improve `myrobocasa_takeitback_planner` until all 100 evaluation seeds succeed (
 
 ## Metrics
 
-- **Primary**: `successes` (count, higher is better), from 100 seeds run remotely with 25 workers.
+- **Primary**: `successes` (count, higher is better), from 100 seeds run remotely with 10 workers.
 - **Secondary**: `completed` terminal result logs, `stage3`, `stage5`, `stage12`, `missing`.
 
 ## How to Run
 
 `./.auto/measure.sh` runs the prescribed remote benchmark:
-`NO_VIDEO=1 SEED_COUNT=100 WORKERS=25 PLANNER_NAME=myrobocasa_takeitback_planner LOG_PREFIX=takeitback bash .auto/measure.sh`
+`NO_VIDEO=1 SEED_COUNT=100 WORKERS=10 PLANNER_NAME=myrobocasa_takeitback_planner LOG_PREFIX=takeitback bash .auto/measure.sh`
 
-The script clears local generated `logs/`, runs seeds 1..100, and emits `METRIC name=value` lines. A result counts only when that seed's terminal event has `success: true`; missing or abruptly terminated runs do not count as success.
+The script clears local generated `logs/`, runs seeds 1..100 with 10 workers, and emits `METRIC name=value` lines. A result counts only when that seed's terminal event has `success: true`; missing or abruptly terminated runs do not count as success.
 
 ## Files in Scope
 
@@ -38,7 +38,7 @@ Read-only context:
 
 - Use `uv` for Python/package execution; no dependency additions.
 - Keep planner deterministic for a given seed where possible.
-- Every code change must be tested by the 100-seed metric at 25 workers before keeping it.
+- Every code change must be tested by the 100-seed metric at 10 workers before keeping it.
 - Favor one coherent geometric plan over local patches. Simplify/remove contradictory old paths when replacing them.
 - If a benchmark is incomplete, diagnose measurement/runner integrity separately; do not tune planner against missing data.
 
@@ -58,4 +58,4 @@ The current planner is over-constrained by a fixed straight-arm configuration, p
 
 These mechanisms are useful diagnostics, but the benchmark evidence points to a geometric redesign rather than more attempts at the same pose. Update this section after each meaningful experiment with the result and the general lesson, including discarded ideas.
 
-Latest nonholonomic TakeItBack experiments: e4 turn-drive-turn control reached 96/100 at 25 workers. Full Stage12 opening regressed to 95/100. Closed-gripper 12-step settling before initial/tray lifts improved to 97/100 and is kept. Low-torso recovery and pre-grasp arm reset regressed and were discarded. Remaining failures span initial grasp/lift, tray transport/regrasp, and final release; do not tune individual seeds. User requires global geometry, 100 seeds, 25 workers.
+Latest nonholonomic TakeItBack experiments: e4 turn-drive-turn control reached 96/100 at 25 workers. Full Stage12 opening regressed to 95/100. Closed-gripper 12-step settling before initial/tray lifts improved to 97/100 and is kept. Required pd_joint_delta_pos adapter reached 99/100 at 25 workers; remaining failure seed86 was a false-positive fallback grasp that slipped during Stage4 lift. User now requires global geometry, 100 seeds, 10 workers for subsequent runs.

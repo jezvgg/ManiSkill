@@ -157,6 +157,7 @@ echo "==> pull logs back -> ./logs/"
 pulled=0
 for _ in $(seq 1 12); do
   if rsync -rlt --no-perms --no-owner --no-group \
+    --exclude='*.h5' --exclude='*.mp4' \
     "${REMOTE_HOST}:${RUNDIR}/logs/" ./logs/ >/dev/null 2>&1; then
     pulled=1
     break

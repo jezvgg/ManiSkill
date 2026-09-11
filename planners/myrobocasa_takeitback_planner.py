@@ -783,7 +783,23 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 _sync()
         return got
 
-    def fallback_grasp():
+    def verify_load_bearing_grasp(lift=0.08, min_rise=0.04, restore=False):
+        """Reject a fallback contact that cannot carry a slow intermediate lift."""
+        if not cup_held() or tcp_cup_gap() > 0.08:
+            return False
+        torso_z = float(hold_b()[2])
+        cup_z = float(unwenv.cup.pose.p[0][2])
+        ramp_torso(torso_z + lift, steps=80)
+        valid = (
+            cup_held()
+            and float(unwenv.cup.pose.p[0][2]) >= cup_z + min_rise
+            and tcp_cup_gap() <= 0.12
+        )
+        if not valid or restore:
+            ramp_torso(torso_z, steps=80)
+        return valid and cup_held() and tcp_cup_gap() <= 0.12
+
+    def fallback_grasp(load_test=False):
         # drive the base closer (arm HIGH - the mid-grasp low-torso drive near
         # the counter fails to move the base) so the cup is inside the
         # workspace, then re-run the arm align. Returns True if the cup is held.
@@ -814,10 +830,23 @@ def planning(env, seed, debug=False, vis=None, info=False):
             planner.close_gripper()
             _sync()
             if cup_held() and tcp_cup_gap() <= 0.08:
-                return True
+                if not load_test or verify_load_bearing_grasp():
+                    return True
             planner.open_gripper()
             _sync()
-        return run_grasp()
+        if not load_test:
+            return run_grasp()
+        if run_grasp() and verify_load_bearing_grasp():
+            return True
+        if cup_held():
+            planner.open_gripper()
+            _sync()
+        if alternate_grasp() and verify_load_bearing_grasp():
+            return True
+        if cup_held():
+            planner.open_gripper()
+            _sync()
+        return False
 
     def alternate_grasp():
         """Try a live front-facing grasp after repeated vertical stalls."""
@@ -900,7 +929,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # (drive base closer + re-run the align) and retry the lift once.
         env.log_event("phase", "Stage 4: re-grasp (lift detect)")
         ramp_torso(TORSO_GRASP, steps=80)
-        if fallback_grasp():
+        if fallback_grasp(load_test=True):
             # pi-lens-ignore: unchecked-throwing-call-python
             cup_z0 = float(unwenv.cup.pose.p[0][2])
             ramp_torso(TORSO_TRANSPORT, steps=150)
