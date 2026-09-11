@@ -69,10 +69,14 @@ def main():
                 if src_robot in art and src_robot != args.robot:
                     art[args.robot] = art.pop(src_robot)
         actions = traj["actions"][:]
-        rewards = traj["rewards"][:]
-        success = traj["success"][:]
-        terminated = traj["terminated"][:]
-        truncated = traj["truncated"][:]
+        arrays = {
+            name: traj[name][:]
+            for name in ("rewards", "success", "terminated", "truncated")
+        }
+        rewards = arrays["rewards"]
+        success = arrays["success"]
+        terminated = arrays["terminated"]
+        truncated = arrays["truncated"]
         src_flat_obs = traj["obs"][:] if traj["obs"].ndim == 2 else None
     T = len(actions)
 
@@ -89,6 +93,10 @@ def main():
             ("terminated", terminated), ("truncated", truncated),
         ):
             g.create_dataset(name, data=arr[::args.stride], dtype=arr.dtype)
+        # terminal flags: the source flips success on its final step, which is
+        # not necessarily stride-aligned; carry the terminal values over
+        for name in ("success", "terminated", "truncated"):
+            g[name][-1] = bool(arrays[name][-1])
         sensor_names = [k for k in obs["sensor_data"].keys()]
         cam_groups = {}
         for cam in sensor_names:
