@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 from collections import deque
@@ -97,6 +98,14 @@ ARM_SCREW_UNJAM = os.environ.get("MIKASA_ARM_SCREW_UNJAM", "1") == "1"
 #: and those refused turns have a median of 82-93 deg with 49-56 % of them over 90 —
 #: the half that stops existing if the base does not turn round at all.
 BASE_REVERSE = os.environ.get("MIKASA_BASE_REVERSE", "1") == "1"
+#: With the arm frozen for a drive (`freeze_arm=True`), probe each aim's DRIVE from the
+#: posture the opening turn would leave — the base screw planned from a hypothetical
+#: qpos, nothing executed — and put the aims whose drive plans first (2026-09-09,
+#: SeasonDish 3608: nose-first the held shaker led the drive into the left wall, found
+#: out only after the 90 deg opening turn had been paid; tail-first plans, and costs the
+#: same 180 deg). When forward alone was on offer and its drive does not plan, the
+#: backwards aim is added behind it so there is something to fall to.
+DRIVE_PROBE_AIMS = os.environ.get("MIKASA_DRIVE_PROBE_AIMS", "1") == "1"
 
 #: How much less the base must turn, in DEGREES, before backwards is offered at all.
 #: Not a taste setting — a correctness one, and it is what a per-task survey of the five
@@ -287,6 +296,15 @@ BASE_PLAN_MASK = [True, True, True, False] + [True] * 11
 # qpos as the arm action on every step whatever the plan says, so the mask decides
 # whether a base move plans at all, never what the arm executes.
 BASE_ONLY_PLAN_MASK = [True, True, True] + [False] * 12
+#: The arm-frozen drive's screw with base x and y ONLY (2026-09-09): with the held
+#: object swung to the side of the base, the yaw column of the Jacobian is parallel
+#: to the drive and the least-norm step spends yaw on a pure translation — the plan
+#: curves and "no convergence after 200 step(s)" (SeasonDish 3811 after the shoulder-pan
+#: swing). The differential base drives straight and `follow_moving_forward` drops the
+#: lateral part anyway, so an x/y-only plan is the motion that is executed. Only for
+#: `freeze_arm=True` drives; the default mask is untouched.
+BASE_XY_PLAN_MASK = [True, True, False] + [False] * 12
+DRIVE_XY_ONLY_WHEN_FROZEN = os.environ.get("MIKASA_DRIVE_XY_ONLY", "1") == "1"
 
 
 class MikasaPandaArmSolverV2(PandaArmMotionPlanningSolver):
@@ -732,27 +750,108 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         raise NotImplementedError(f"{type(self).__name__} composes actions for "
                                   f"{self.COMPOSE_MODES}, not {mode!r}")
 
-    #: `pd_joint_delta_pos` path following: the knot advances once every arm joint is
-    #: within this of it (rad); under the controller's 0.1 step, so the delta never
-    #: saturates and the arm follows the plan's geometry, not a chord to a knot ahead.
-    DELTA_LAG_GATE = float(os.environ.get("MIKASA_DELTA_LAG_GATE", "0.08"))
-    #: The most steps a single knot may be re-issued for before the clock moves on
-    #: regardless (a knot the arm cannot reach — contact, a limit — must not hang).
-    DELTA_LAG_MAX_STALL = int(os.environ.get("MIKASA_DELTA_LAG_MAX_STALL", "10"))
+    #: `pd_joint_delta_pos` path following: the plan's clock runs at full rate while
+    #: every arm joint is within this of its target (rad); under the controller's 0.1
+    #: step, so the delta never saturates and the arm follows the plan's geometry, not a
+    #: chord to a knot ahead.
+    DELTA_LAG_GATE = float(os.environ.get("MIKASA_DELTA_LAG_GATE", "0.05"))
+    #: The slowest the clock runs when the arm lags (knots per step): the rate is
+    #: gate/lag, floored here — a slowdown, never a stop (the stop-and-go of the first
+    #: cure cost the arm 2.6–3.8x its acceleration RMS).
+    DELTA_CLOCK_MIN_RATE = float(os.environ.get("MIKASA_DELTA_CLOCK_MIN_RATE", "0.10"))
+    #: The most extra steps a leg may take, as a fraction of its knots (a knot the arm
+    #: cannot reach — contact, a limit — must not hang the leg).
+    DELTA_CLOCK_MAX_EXTRA = float(os.environ.get("MIKASA_DELTA_CLOCK_MAX_EXTRA", "1.0"))
+    #: How close (rad, max over the arm) the arm must be to the LAST knot before the leg
+    #: is over — the next stage acts on the pose the plan promised.
+    DELTA_END_TOL = float(os.environ.get("MIKASA_DELTA_END_TOL", "0.015"))
+    #: A knot is blocked when the arm, behind it, moves no joint by more than this (rad)
+    #: over DELTA_LAG_NO_PROGRESS consecutive steps; the clock then stops slowing for
+    #: the rest of the leg (3771: a knot behind a counter edge).
+    DELTA_STALL_MOVE = float(os.environ.get("MIKASA_DELTA_STALL_MOVE", "0.002"))
+    DELTA_LAG_NO_PROGRESS = int(os.environ.get("MIKASA_DELTA_LAG_NO_PROGRESS", "5"))
+
+    def _arm_limits(self):
+        """(lower, upper) of the arm's joints in the arm controller's order, or None."""
+        try:
+            lim = self.robot.get_qlimits()[0].cpu().numpy()
+            idx = list(self.env_agent.controller.controllers["arm"].active_joint_indices)
+            return lim[idx, 0].astype(np.float64), lim[idx, 1].astype(np.float64)
+        except Exception:
+            return None
 
     def _arm_lag(self, arm_target) -> float:
         """max |target - measured| over the arm's joints, rad."""
         q = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
         return float(np.max(np.abs(np.asarray(arm_target, dtype=np.float64) - q)))
 
+    #: While set (a world xyz), the drives hold the head TOWARD this point instead of at
+    #: zero (2026-09-09, the owner: a backwards drive is acceptable if the cameras watch the
+    #: destination): the pan is the bearing to the point from the base's heading, within
+    #: the joint's range, the tilt the elevation from the head, both moved at most
+    #: HEAD_STEP per control step. The base cameras hang on the head, so this is
+    #: what keeps the bowl in the robot's own view while it drives — backwards, the head
+    #: at ±1.5 looks along the counter and the bowl comes into frame as it nears.
+    head_look_at = None
+
+    @contextlib.contextmanager
+    def look_at(self, point):
+        """`head_look_at` set to `point` for the drives inside; cleared on exit."""
+        prev = self.head_look_at
+        self.head_look_at = None if point is None else np.asarray(point, dtype=np.float64).reshape(-1)[:3].copy()
+        try:
+            yield
+        finally:
+            self.head_look_at = prev
+
+    def _head_toward(self, point, body_now):
+        """(pan, tilt) targets that turn the head toward `point`, one bounded step from
+        where the head is."""
+        try:
+            base = self.base_env.agent.base_link.pose.sp
+            heading = base.to_transformation_matrix()[:3, 0]
+            d = np.asarray(point, dtype=np.float64)[:3] - np.asarray(base.p, dtype=np.float64)[:3]
+            yaw = float(np.arctan2(heading[1], heading[0]))
+            bearing = float(np.arctan2(d[1], d[0])) - yaw
+            bearing = float(np.arctan2(np.sin(bearing), np.cos(bearing)))
+            jm = self.env_agent.robot.active_joints_map
+            p_lo, p_hi = (float(v) for v in jm["head_pan_joint"].limits.reshape(-1)[:2].tolist())
+            t_lo, t_hi = (float(v) for v in jm["head_tilt_joint"].limits.reshape(-1)[:2].tolist())
+            pan = float(np.clip(bearing, p_lo + 0.05, p_hi - 0.05))
+            head_z = float(np.asarray(base.p)[2]) + 1.25          # the head over the base, roughly
+            tilt = float(np.clip(np.arctan2(head_z - float(d[2] + base.p[2]), max(0.3, float(np.hypot(d[0], d[1])))),
+                                 t_lo + 0.05, t_hi - 0.05))
+            return self._head_step(body_now, pan, tilt)
+        except Exception:  # a double without joints; the head stays
+            return 0.0, 0.0
+
+    #: The head's target is never more than this far from where the head IS (2026-09-10):
+    #: the body channel is a delta of 0.1 rad per step and the head's PD moves ~0.039 rad
+    #: per step whatever is asked, so a target set from a ramp or snapped to zero runs
+    #: ahead of the head and the recorded action saturates at +-1 (SeasonDish 3600:
+    #: 137 of 708 steps, the look-around and the return to zero after the drive). From
+    #: the measured head with this step the action stays at ~0.9 and the head moves at
+    #: the same speed — the arm's clock, for the head.
+    HEAD_STEP = 0.09
+
+    def _head_step(self, body_now, goal_pan: float, goal_tilt: float):
+        """(pan, tilt) targets one bounded step from the measured head toward the goals."""
+        step = self.HEAD_STEP
+        pan = float(body_now[0] + np.clip(goal_pan - body_now[0], -step, step))
+        tilt = float(body_now[1] + np.clip(goal_tilt - body_now[1], -step, step))
+        return pan, tilt
+
     def _hold_targets(self, head_zero: bool = True):
         """The measured arm pose and body pose, as ABSOLUTE targets to hold; the head
         at zero when `head_zero` (the drives' convention since the fork: the head is
-        parked while the base moves)."""
+        parked while the base moves) — or toward `head_look_at` when that is set."""
         arm = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
         body = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
         if head_zero:
-            body[0] = body[1] = 0.0
+            if self.head_look_at is not None:
+                body[0], body[1] = self._head_toward(self.head_look_at, body)
+            else:
+                body[0], body[1] = self._head_step(body, 0.0, 0.0)
         return arm, body
 
     # -- the base's dropped lateral velocity (the supervisor's item 3, 2026-09-08) ----
@@ -819,13 +918,73 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         `stepping.report`, which does the work and explains the split."""
         report(self.env, stage, fields, to_trace=to_trace)
 
+    #: The planner's window on the three arm ROLL joints, +-rad, set on the sim's
+    #: articulation only while the planning world is built. **Off since 2026-09-10**,
+    #: when the owner took the URDF back to the stock +-3.141 ("тогда и синхронизировать
+    #: с jezvgg не придётся"): a window is only ever a NARROWING, and at 3.44 on a joint
+    #: that now stops at 3.141 it would hand the planner limits the simulator will not
+    #: honour. It stays as a knob for a tree that widens the URDF again — the history is
+    #: worth keeping: with the roll joints at +-6.28 the owner objected to the recordings
+    #: (2026-09-09, "огромная намотка углов", upperarm_roll to 6.0 rad), and 3.44 was
+    #: just over one turn, so every wrist pose had an equivalent inside the window while
+    #: no plan could wind past it. Measured cost of the stock limits instead (200
+    #: SeasonDish seeds, 10 Hz): success 199/200 -> 198/200 and the p90 of roll travel
+    #: 11.4 -> 12.9 rad, which is the +-pi seam (a 331 deg unwind for a 29 deg move,
+    #: K54/D14) coming back.
+    PLAN_ROLL_WINDOW = float(os.environ.get("MIKASA_PLAN_ROLL_WINDOW", "0"))
+    ROLL_JOINT_NAMES = ("upperarm_roll_joint", "forearm_roll_joint", "wrist_roll_joint")
+
+    def _roll_joints(self):
+        return [j for j in self.robot.active_joints if any(j.name.endswith(n) for n in self.ROLL_JOINT_NAMES)]
+
+    @contextlib.contextmanager
+    def roll_room(self):
+        """The roll joints' planning limits widened to the simulator's own for the
+        plans made inside — a no-op since the URDF went back to the stock +-3.141
+        (2026-09-10), because the planner's window is then off and the two limits are
+        the same; kept for a tree that widens the URDF again — for a motion that IS a roll (2026-09-09: SeasonDish's pour is
+        165 deg of wrist roll; from a wrist parked at +1.2 after the grasp the window of
+        +-3.44 refuses the last 75 deg, `joint limit at index [12]`, and the RRT that
+        replaced it turned the whole arm). Only the screw's limit check reads these
+        limits at plan time — RRT's state space keeps the window — so what is widened is
+        exactly a straight roll. Restored on exit."""
+        inner = getattr(self, "planner", None)
+        limits = getattr(inner, "joint_limits", None)
+        if limits is None:
+            yield
+            return
+        idx = [i for i, j in enumerate(self.robot.active_joints)
+               if any(j.name.endswith(n) for n in self.ROLL_JOINT_NAMES)]
+        sim = self.robot.get_qlimits()[0].cpu().numpy()
+        saved = np.array(limits, dtype=np.float64).copy()
+        try:
+            for i in idx:
+                if i < len(limits):
+                    limits[i] = [float(sim[i, 0]), float(sim[i, 1])]
+            yield
+        finally:
+            for i in idx:
+                if i < len(limits):
+                    limits[i] = saved[i]
+
     def setup_planner(self, *args, **kwargs):
         planned_articulation = self._sim_scene.get_all_articulations()[0]
-        planning_world = SapienPlanningWorldV2(
-            self._sim_scene,
-            [planned_articulation],
-            disable_actors_collision=self.disable_actors_collision,
-        )
+        # narrow the roll joints for the planner's eyes only (see PLAN_ROLL_WINDOW)
+        narrowed = []
+        if self.PLAN_ROLL_WINDOW > 0:
+            for j in self._roll_joints():
+                raw = j._objs[0]
+                narrowed.append((raw, np.array(raw.limits, dtype=np.float64).copy()))
+                raw.set_limits(np.array([[-self.PLAN_ROLL_WINDOW, self.PLAN_ROLL_WINDOW]], dtype=np.float32))
+        try:
+            planning_world = SapienPlanningWorldV2(
+                self._sim_scene,
+                [planned_articulation],
+                disable_actors_collision=self.disable_actors_collision,
+            )
+        finally:
+            for raw, lim in narrowed:
+                raw.set_limits(lim.astype(np.float32))
 
         # Get joint info for debugging
         joint_names = [joint.get_name() for joint in self.robot.get_active_joints()]
@@ -1067,7 +1226,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         h, d = h / nh, d / nd
         return abs(float(np.arctan2(h[0] * d[1] - h[1] * d[0], float(np.dot(h, d)))))
 
-    def approach_aims(self, target_pos, target_view_vec, reverse_ok: bool = True):
+    def approach_aims(self, target_pos, target_view_vec, reverse_ok: bool = True,
+                      reverse_only: bool = False):
         """How to reach a dock, cheapest first: backwards then forwards, or forwards alone.
 
         A differential-drive base cannot go sideways, so `drive_base` is turn, drive,
@@ -1090,6 +1250,13 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
           different motion sweeping a different volume, and when both refuse the leg
           returns -1 as before.
 
+        `reverse_only=True` (2026-09-09) is the caller's explicit ask for the backwards
+        approach alone — SeasonDish's bowl dock against the left wall: nose-first the
+        held object leads the drive into the wall, and the tuck that used to answer that
+        wound the arm (`carry_pose` yaw 90: upperarm and forearm rolls +2 rad each) and
+        left the hover to unwind it. Backwards, the arm trails the drive and stays as it
+        was grasped. Offered as a second try after the forward refusal, never first.
+
         Returns `(direction, is_reverse, total_turn_radians)` entries, cheapest first.
         """
         d = np.asarray(target_pos, dtype=float).reshape(-1)[:3] - self.base_env.agent.base_link.pose.sp.p
@@ -1101,6 +1268,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             return c if target_view_vec is None else c + self.turn_cost(aim, target_view_vec)
 
         forward = (d, False, total(d))
+        if reverse_only:
+            return [(-d, True, total(-d))]
         if not (BASE_REVERSE and reverse_ok):
             return [forward]
         rev_cost = total(-d)
@@ -1108,8 +1277,81 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             return [forward]
         return [(-d, True, rev_cost), forward]
 
+    def drive_plans_after_turn(self, target_pos, aim, qpos=None, tcp=None, view=None) -> bool:
+        """Would the base screw to `target_pos` plan, with the arm frozen, from the
+        posture the opening turn toward `aim` leaves? Planned from a hypothetical qpos
+        (the yaw joint advanced by the turn, the hand carried round with the base);
+        nothing is executed. True when it plans; a solver without the planner says True
+        (nothing to probe with).
+
+        `qpos` / `tcp` (2026-09-09): the arm as the caller WOULD set it before the drive —
+        SeasonDish probes a shoulder-pan swing this way — with the TCP pose that goes
+        with it (the caller's FK); defaults are the robot as it stands. `view`: when
+        given, the closing turn at the dock from the drive heading to `view` is swept
+        in the planning world too (every 10 deg, the arm frozen), so an aim whose drive
+        plans but whose closing turn would hit the wall is not offered."""
+        inner = getattr(self, "planner", None)
+        if inner is None or not callable(getattr(inner, "plan_screw", None)):
+            return True
+        try:
+            base = self.base_env.agent.base_link.pose.sp
+            heading = base.to_transformation_matrix()[:3, 0]
+            a = np.asarray(aim, dtype=float).reshape(-1)[:2]
+            h = heading[:2]
+            if np.linalg.norm(a) < 1e-9 or np.linalg.norm(h) < 1e-9:
+                return True
+            dyaw = float(np.arctan2(h[0] * a[1] - h[1] * a[0], h[0] * a[0] + h[1] * a[1]))
+            q = (np.asarray(qpos, dtype=np.float64).reshape(-1).copy() if qpos is not None
+                 else self.robot.get_qpos().cpu().numpy()[0].astype(np.float64).copy())
+            q[2] += dyaw
+            turn = sapien.Pose(q=np.array([np.cos(dyaw / 2), 0.0, 0.0, np.sin(dyaw / 2)]))
+            tcp = tcp if tcp is not None else self.base_env.agent.tcp.pose.sp
+            tcp_turned = base * turn * (base.inv() * tcp)
+            delta = np.asarray(target_pos, dtype=float).reshape(-1)[:3] - base.p
+            delta[2] = 0.0
+            goal = sapien.Pose(p=np.asarray(tcp_turned.p) + delta, q=tcp_turned.q)
+            result = inner.plan_screw(
+                mplib.Pose(p=goal.p, q=goal.q), q,
+                time_step=self.base_env.control_timestep,
+                masked_joints=BASE_XY_PLAN_MASK if DRIVE_XY_ONLY_WHEN_FROZEN else BASE_ONLY_PLAN_MASK,
+            )
+            if str(result.get("status")) != "Success":
+                return False
+            if view is None:
+                return True
+            # The closing sweep at the dock: the base parked, yaw stepped from the drive
+            # heading to the view heading the short way, the arm as given.
+            v = np.asarray(view, dtype=float).reshape(-1)[:2]
+            if np.linalg.norm(v) < 1e-9:
+                return True
+            dclose = float(np.arctan2(a[0] * v[1] - a[1] * v[0], a[0] * v[0] + a[1] * v[1]))
+            pos = np.asarray(result["position"])
+            q_dock = q.copy()
+            for i, j in enumerate(inner.move_group_joint_indices):
+                q_dock[j] = pos[-1, i]
+            world = inner.planning_world
+            # The short way first, then the long way round — as `rotate_base_z` turns.
+            for turn in (dclose, dclose - np.sign(dclose) * 2 * np.pi if abs(dclose) > 1e-6 else -2 * np.pi):
+                n = max(2, int(abs(turn) / np.radians(10.0)) + 1)
+                clear = True
+                for k in range(1, n + 1):
+                    qk = q_dock.copy()
+                    qk[2] = q_dock[2] + turn * k / n
+                    qf = inner.fold_qpos(inner.pad_move_group_qpos(qk))
+                    world.set_qpos_all(qf[inner.move_group_joint_indices])
+                    if world.is_state_colliding():
+                        clear = False
+                        break
+                if clear:
+                    return True
+            return False
+        except Exception as e:  # pragma: no cover - the probe must never lose a leg
+            print(f"[drive_base] aim probe raised {type(e).__name__}: {e}")
+            return True
+
     def drive_base(self, target_pos=None, target_view_vec=None, freeze_arm: bool = False,
-                   arrive_tol: float | None = None, reverse_ok: bool = True):
+                   arrive_tol: float | None = None, reverse_ok: bool = True,
+                   reverse_only: bool = False):
         """Turn toward `target_pos`, drive to it, then turn to face `target_view_vec`.
 
         `freeze_arm` is passed straight to `move_base_forward`; see
@@ -1157,7 +1399,25 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 # different swept volume, not the refusal being silenced (K113), and if
                 # both refuse the leg still returns -1 exactly as it always did.
                 cands = self.approach_aims(target_pos, target_view_vec,
-                                           reverse_ok=reverse_ok)
+                                           reverse_ok=reverse_ok, reverse_only=reverse_only)
+                if DRIVE_PROBE_AIMS and freeze_arm and not reverse_only:
+                    if len(cands) == 1 and reverse_ok and BASE_REVERSE:
+                        cands = cands + self.approach_aims(target_pos, target_view_vec,
+                                                           reverse_ok=True, reverse_only=True)
+                    probed = [(c, self.drive_plans_after_turn(target_pos, c[0], view=target_view_vec)) for c in cands]
+                    good = [c for c, ok in probed if ok]
+                    bad = [c for c, ok in probed if not ok]
+                    if bad:
+                        self._report("drive_base", to_trace=False, probe="aims",
+                                     plans=[bool(ok) for _c, ok in probed],
+                                     reverse=[bool(c[1]) for c, _ok in probed])
+                    if not good:
+                        # Nothing on offer plans: refuse WITHOUT the opening turn, so the
+                        # caller's recovery (a swing of the arm, a tuck) starts from the
+                        # posture it has, not from a wasted 90-180 deg turn (2026-09-09).
+                        self._report("drive_base", to_trace=False, probe="aims", refused="no aim plans; no turn made")
+                        return -1
+                    cands = good + bad
                 res, chosen = -1, None
                 for i, (aim, rev, cost) in enumerate(cands):
                     res = self.rotate_base_z(aim)
@@ -1211,7 +1471,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         """
         if self.truncated:
             return self._guard.last_step
-        mask = BASE_ONLY_PLAN_MASK if freeze_arm else BASE_PLAN_MASK
+        mask = ((BASE_XY_PLAN_MASK if DRIVE_XY_ONLY_WHEN_FROZEN else BASE_ONLY_PLAN_MASK)
+                if freeze_arm else BASE_PLAN_MASK)
         tcp_pose = self.base_env.agent.tcp.pose.sp
         base_link_pose = self.base_env.agent.base_link.pose.sp
         delta = new_base_pose - base_link_pose.p
@@ -1554,7 +1815,7 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         Returns the follower's 5-tuple, or None when no line planned — the caller's
         screw and RRT then run unchanged. A planner without `IK` (a double) gets None.
         """
-        from utils.mikasa_oracle.motionplanning.fetch.utils import goal_order, unwrap_toward
+        from utils.mikasa_oracle.motionplanning.fetch.utils import ik_seam_goals
         p = self.planner
         if not callable(getattr(p, "IK", None)) or not callable(getattr(p, "plan_qpos_line", None)):
             return None
@@ -1563,7 +1824,9 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         try:
             cur_f = p.fold_qpos(cur)
             goal_b = p._transform_goal_to_wrt_base(mplib.Pose(p=target_tcp_pose.p, q=target_tcp_pose.q))
-            status, goal_qpos = p.IK(goal_b, cur_f, only_manipulate, n_init_qpos=n_init_qpos)
+            # the seam preference and its one retry live here too (`ik_seam_goals`);
+            # `_line_to_ik_goals` re-runs the unwrap and the order, which is idempotent
+            status, goal_qpos = ik_seam_goals(p, goal_b, cur_f, only_manipulate, n_init_qpos)
         except Exception as e:  # pragma: no cover - the solver's own failure modes
             self._report("static_manipulation", plan="line", status=f"IK raised {type(e).__name__}: {e}"[:140])
             return None
@@ -1583,11 +1846,17 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         attempt while the descent from there was refused at the stove, and the episode
         ran out of horizon — a refusal that used to cost no steps became a paid leg).
         """
-        from utils.mikasa_oracle.motionplanning.fetch.utils import goal_order, unwrap_toward
+        from utils.mikasa_oracle.motionplanning.fetch.utils import (goal_order, limit_joint_names,
+                                                              seam_first, unwrap_toward)
         p = self.planner
         goals = [unwrap_toward(np.asarray(g, dtype=float), cur_f, p.joint_limits)
                  for g in np.atleast_2d(goal_qpos)]
-        order = goal_order(goals, cur_f)
+        # nearest first, then the ones that leave the roll joints room (`seam_first`)
+        order = seam_first(goal_order(goals, cur_f), p.joint_limits, names=limit_joint_names(p))
+        if os.environ.get("MIKASA_LINE_DEBUG"):
+            print(f"[line-debug] {tag}: cur rolls {np.round(cur_f[[8, 10, 12]], 2).tolist()} raw goals rolls "
+                  f"{[np.round(np.asarray(g, dtype=float)[[8, 10, 12]], 2).tolist() for g in np.atleast_2d(goal_qpos)]} "
+                  f"ordered rolls {[np.round(g[[8, 10, 12]], 2).tolist() for g in order]}", flush=True)
         root = set(p._root_cols() or [])
         tried = []
         for k, g in enumerate(order[:self.LINE_IK_GOALS]):
@@ -2230,7 +2499,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             return -1
         return out
 
-    def drive_straight(self, distance, v: float = 0.10, max_steps=None, stop_when=None):
+    def drive_straight(self, distance, v: float = 0.10, max_steps=None, stop_when=None,
+                       hold_pose: bool = False):
         """Drive the base straight by `distance` metres (negative = reverse), unplanned.
 
         The `follow_arc` template with the arc law replaced by a constant: no
@@ -2258,6 +2528,20 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 inside the 1 m/s slot).
             max_steps: hard cap; None = `ceil(|distance| / (v * control_dt)) * 2 + 20`.
             stop_when: nullary callable; truthy stops the drive after that step.
+            hold_pose: latch the arm/torso targets ONCE on entry instead of re-reading
+                the measured qpos every step. Default False — the compliant hold of
+                K104, byte-identical for every existing caller.
+
+                Why it exists (measured 2026-09-10, `MikasaCabinetStowProp-v0`): the
+                compliant hold commands "stay where you are", which under
+                `pd_joint_delta_pos` is a zero increment FROM THE MEASURED POSE. With a
+                payload the arm creeps down under gravity and the controller follows it
+                rather than resisting: carrying a 243 g box, the TCP sank **3.9 cm over
+                the 68 steps** of a 0.31 m drive, against 2 mm with an 8 g cup. The
+                object then crossed the shelf's own edge with 4 mm to spare and caught
+                it (prop seed 2: it arrived tilted 20.7 deg and fell flat when released).
+                Latching the entry pose turns the same hold into an absolute target, so
+                `_compose` emits a corrective delta each step and the arm holds height.
 
         Returns:
             The last gym 5-tuple (or the guard's last step when already truncated);
@@ -2286,8 +2570,11 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         reason = "max-steps"
         travelled = 0.0
         i = -1
+        latched = self._hold_targets() if hold_pose else None
         for i in range(int(max_steps)):
-            arm_action, body_action = self._hold_targets()
+            arm_action, body_action = (
+                latched if latched is not None else self._hold_targets()
+            )
             base_action = np.array([np.clip(sign * speed, -1.0, 1.0), 0.0])
             action = self._compose(arm_action, body_action, base_action)
             out = self._step(action)
@@ -2413,23 +2700,44 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         qpos_dict_final = self._final_qpos_dict(result)
         n_step = result["position"].shape[0]
 
-        # In `pd_joint_delta_pos` the knot only advances once the arm is within
-        # `DELTA_LAG_GATE` of the current one (`_arm_lag`): the delta controller caps the
-        # PD error at one step (0.1 rad), so it caps the torque and the speed, and an arm
-        # that falls behind an open-loop clock is pulled toward knots AHEAD of it — a
-        # straight line in joint space through whatever the plan went around (SeasonDish
-        # 3608, 2026-09-09: the approach cut a corner and knocked the shaker 32 cm). The
-        # stall re-issues the same knot with the BASE HELD, so the base still integrates
-        # exactly the plan's velocities; `DELTA_LAG_MAX_STALL` bounds it per knot.
+        # In `pd_joint_delta_pos` the plan's clock runs at the arm's pace. The delta
+        # controller caps the PD error at one step (0.1 rad), so it caps the torque and
+        # the speed, and an arm that falls behind an open-loop clock is pulled toward
+        # knots AHEAD of it — a chord in joint space through whatever a screw or RRT path
+        # went around (SeasonDish 3608, 2026-09-09: the approach cut a corner and knocked
+        # the shaker 32 cm). First cure, stop-and-go (re-issue the knot until the arm is
+        # within DELTA_LAG_GATE): every loss of that class recovered, but the arm's
+        # acceleration RMS went 0.3 → 0.7–1.2 rad/s² (each stall is a full stop and a
+        # restart). This cure keeps a CONTINUOUS clock `s`: it advances by 1 knot per
+        # step while the arm is within the gate, and by `gate/lag` (never under
+        # DELTA_CLOCK_MIN_RATE) when it lags — slowing, not stopping. The target is the
+        # plan interpolated at `s`, and the BASE'S planned velocity is scaled by the same
+        # rate, so the base integrates exactly the plan's path (the same distance over
+        # more steps), never a repeat of a full-speed command on an extra step.
+        # DELTA_CLOCK_MAX_EXTRA bounds the extra steps a leg may take (a knot the arm
+        # cannot reach — contact, a limit — must not hang).
         gate = self.control_mode == "pd_joint_delta_pos"
-        i, stalled, stalls_total = 0, 0, 0
+        pos_all, vel_all = np.asarray(result["position"], dtype=np.float64), np.asarray(result["velocity"], dtype=np.float64)
+        s_clock, rate, extra, i = 0.0, 1.0, 0, 0
+        max_extra = int(self.DELTA_CLOCK_MAX_EXTRA * n_step) + 10
+        prev_q, no_progress, blocked = None, 0, False
+        # mplib plans the roll joints past the sim's +-6.28 (3771: forearm_roll to -7.19;
+        # the subagent's finding) — a knot the sim cannot reach in ANY mode. Clamp the
+        # arm targets to the robot's limits so the follower never waits for one.
+        arm_lim = self._arm_limits()
         while i < n_step:
             arm_action = (
                 self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy()
             )
 
-            qpos = result["position"][min(i, n_step - 1)]
-            qvel = result["velocity"][min(i, n_step - 1)]
+            if gate:
+                k = int(np.floor(s_clock)); frac = float(s_clock - k)
+                k1 = min(k + 1, n_step - 1)
+                qpos = pos_all[k] + frac * (pos_all[k1] - pos_all[k])
+                qvel = (vel_all[k] + frac * (vel_all[k1] - vel_all[k])) * rate
+            else:
+                qpos = pos_all[min(i, n_step - 1)]
+                qvel = vel_all[min(i, n_step - 1)]
 
             qpos_dict = {}
 
@@ -2441,13 +2749,15 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 self.env_agent.controller.controllers["arm"].config.joint_names
             ):
                 arm_action[n] = qpos_dict[f"scene-0-{self.robot.name}_{joint_name}"]
+            if arm_lim is not None:
+                arm_action = np.clip(arm_action, arm_lim[0], arm_lim[1])
 
             assert self.control_mode in self.COMPOSE_MODES, self.control_mode
 
-            body_action = np.zeros_like(
-                self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
-            )
+            body_now = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
+            body_action = np.zeros_like(body_now)
             body_action[2] = qpos_dict[f"scene-0-{self.robot.name}_torso_lift_joint"]
+            body_action[0], body_action[1] = self._head_step(body_now, 0.0, 0.0)
 
             base_direction = (
                 self.env_agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
@@ -2463,9 +2773,6 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             base_action = np.array([0.0, 0.0])
             base_action[0] = is_forward
 
-            stall = gate and stalled < self.DELTA_LAG_MAX_STALL and self._arm_lag(arm_action) > self.DELTA_LAG_GATE
-            if stall:
-                base_action[:] = 0.0
             action = self._compose(arm_action, body_action, base_action)
             if self.verbose:
                 print("arm Action:", np.round(arm_action, 4))
@@ -2473,19 +2780,51 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 print("base Action:", np.round(base_action, 4))
                 print("qpos: ", np.round(self.robot.get_qpos().cpu().numpy()[0], 4))
             obs, reward, terminated, truncated, info = self._step(action)
-            if stall:
-                stalled += 1
-                stalls_total += 1
+            if gate:
+                # the clock's rate for the NEXT step, from the arm's lag behind the
+                # target it was just given: full while within the gate, gate/lag when
+                # behind. The leg ends when the clock is at the last knot AND the arm
+                # is within the gate of it (or the extra-step budget is spent).
+                lag = self._arm_lag(arm_action)
+                # a knot the arm cannot close on (contact, a limit) must not slow the
+                # clock forever: the arm STANDING STILL while behind — no joint moved
+                # more than DELTA_STALL_MOVE — for DELTA_LAG_NO_PROGRESS steps means the
+                # knot is blocked, and the leg runs at full rate to its end. (A shrinking
+                # lag was the first test, and a lag shrinking slowly on a legitimate
+                # slowdown tripped it: clip 0.2-0.35 came back, 2026-09-09 afternoon.)
+                q_now = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
+                moved = prev_q is None or float(np.max(np.abs(q_now - prev_q))) > self.DELTA_STALL_MOVE
+                if lag > self.DELTA_LAG_GATE and not moved:
+                    no_progress += 1
+                    blocked = blocked or no_progress >= self.DELTA_LAG_NO_PROGRESS
+                else:
+                    no_progress = 0
+                prev_q = q_now
+                behind = lag > self.DELTA_LAG_GATE and extra < max_extra and not blocked
+                if behind:
+                    extra += 1
+                if s_clock >= n_step - 1:
+                    # the leg ends converged: the last knot is re-issued until the arm
+                    # is within DELTA_END_TOL of it (the next stage — a close, a lift —
+                    # reads the pose the plan promised; 3783 closed 1.4 cm off and
+                    # dropped the condiment when the leg ended at the gate's 0.08)
+                    settle = lag > self.DELTA_END_TOL and extra < max_extra
+                    if settle and not behind:
+                        extra += 1
+                    i = n_step - 1 if (behind or settle) else n_step
+                else:
+                    rate = max(self.DELTA_CLOCK_MIN_RATE, self.DELTA_LAG_GATE / lag) if behind else 1.0
+                    s_clock = min(s_clock + rate, float(n_step - 1))
+                    i = int(np.floor(s_clock))
             else:
                 i += 1
-                stalled = 0
             if self._stopped_by_horizon("follow_forward_path_w_refinement"):
                 break
             if stop_when is not None and stop_when():
                 self._report("follow_path", stopped="touch", at=i, of=n_step)
                 return obs, reward, terminated, truncated, info
-        if stalls_total:
-            self._report("follow_path", to_trace=False, knots=n_step, lag_stalls=stalls_total)
+        if gate and extra:
+            self._report("follow_path", to_trace=False, knots=n_step, clock_extra=extra)
 
         if refine and not self.truncated:
             # REFINEMENT!
@@ -2513,13 +2852,12 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                     print(f"Reached max refining steps ({self.max_refine_steps})!")
                     break
 
-                body_action = np.zeros_like(
-                    self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
-                )
+                body_now = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
+                body_action = np.zeros_like(body_now)
                 body_action[2] = qpos_dict_final[
                     f"scene-0-{self.robot.name}_torso_lift_joint"
                 ]
-                body_action[0] = body_action[1] = 0.0
+                body_action[0], body_action[1] = self._head_step(body_now, 0.0, 0.0)
 
                 base_action = np.array([0.0, 0.0])
 
@@ -2609,7 +2947,7 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             and np.allclose(arm_pos, target_arm_pos, atol=eps)
         )
 
-    def change_gripper_state(self, t=6, gripper_state=OPEN, stop_when=None):
+    def change_gripper_state(self, t=6, gripper_state=OPEN, stop_when=None, ramp: int = 0):
         """Drive the gripper to `gripper_state` for `t` steps.
 
         `stop_when`, when given, is polled after every step and ends the motion early.
@@ -2618,9 +2956,17 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         measured `dropped during the lift` runs and never reopen, so a contact that begins
         to slip simply lets them close further — on one seed a 45 mm bottle ends pinched at
         21 mm, mid-topple, having been levered over by the closing motion itself while the
-        arm moved 0.4 mm."""
+        arm moved 0.4 mm.
+
+        `ramp` > 0 spreads the change over that many steps (a linear ramp of the
+        normalized target from where the gripper was last commanded), then holds the
+        goal for the rest of `t`. Without it the target jumps in one control step,
+        and the pads leaving an 8 g cup at that rate toppled it on 6 of 100 Retrieval
+        places (2026-09-09)."""
         if self.truncated:
             return self._guard.last_step
+        start = float(self.gripper_state)
+        goal = float(gripper_state)
         self.gripper_state = gripper_state
         arm_action = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy()
         body_action = (
@@ -2629,6 +2975,9 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         base_action = np.array([0, 0])
 
         for i in range(t):
+            if ramp > 0:
+                frac = min(1.0, (i + 1) / float(ramp))
+                self.gripper_state = start + frac * (goal - start)
             action = self._compose(arm_action, body_action, base_action)
             obs, reward, terminated, truncated, info = self._step(action)
             if self._stopped_by_horizon("change_gripper_state"):
@@ -2641,8 +2990,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
     def close_gripper(self, t=6, stop_when=None):
         return self.change_gripper_state(t=t, gripper_state=CLOSED, stop_when=stop_when)
 
-    def open_gripper(self, t=6):
-        return self.change_gripper_state(t=t, gripper_state=OPEN)
+    def open_gripper(self, t=6, ramp: int = 0):
+        return self.change_gripper_state(t=t, gripper_state=OPEN, ramp=ramp)
 
     def start_tape(self):
         """Begin keeping every action this solver emits, and return the tape.
@@ -2953,6 +3302,44 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 ok = info.get("success", False) if isinstance(info, dict) else False
                 if bool(ok[0] if hasattr(ok, "__len__") else ok):
                     break
+        return out
+
+    def turn_head(self, pan: float | None = None, tilt: float | None = None,
+                  max_steps: int = 120, settle_tol: float = 0.03):
+        """Turn the head to `pan` / `tilt` (radians, absolute; None keeps the joint) with the
+        arm and the base held — the body controller's own channels, one bounded step from
+        the measured head per control step (`HEAD_STEP`, inside the delta clip), until
+        within `settle_tol` or `max_steps`. Returns the last 5-tuple, or -1 when nothing
+        had to move. The head is not
+        in the arm's planning chain, so `plan_joints` cannot move it (2026-09-09,
+        SeasonDish's look-around: its joint line came back one knot long)."""
+        if self.truncated:
+            return self._guard.last_step
+        body_ctrl = self.env_agent.controller.controllers["body"]
+        names = list(body_ctrl.config.joint_names)
+        body = body_ctrl.qpos[0].cpu().numpy().astype(np.float64)
+        goal = body.copy()
+        if pan is not None and "head_pan_joint" in names:
+            goal[names.index("head_pan_joint")] = float(pan)
+        if tilt is not None and "head_tilt_joint" in names:
+            goal[names.index("head_tilt_joint")] = float(tilt)
+        if float(np.max(np.abs(goal - body))) < 1e-4:
+            return -1
+        arm = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
+        out = -1
+        # One bounded step from the MEASURED head each control step (`_head_step`): the
+        # head moves at its own pace (~0.039 rad per step) and the recorded action stays
+        # off the clip; a ramp from the start pose ran ahead of it and saturated.
+        for _ in range(int(max_steps)):
+            now = body_ctrl.qpos[0].cpu().numpy().astype(np.float64)
+            if float(np.max(np.abs(goal[:2] - now[:2]))) < settle_tol and float(abs(goal[2] - now[2])) < settle_tol:
+                break
+            target = now.copy()
+            target[0], target[1] = self._head_step(now, float(goal[0]), float(goal[1]))
+            target[2] = float(goal[2])
+            out = self._step(self._compose(arm, target, np.array([0.0, 0.0])))
+            if self._stopped_by_horizon("turn_head"):
+                break
         return out
 
     def idle_steps(self, t=20):

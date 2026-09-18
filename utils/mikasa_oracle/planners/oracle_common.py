@@ -135,8 +135,21 @@ def stopped_by_horizon(planner) -> bool:
     return bool(getattr(planner, "truncated", False))
 
 
+#: The grasp leg tries its straight plans first and, refused, the same straight plan
+#: with the target out of the planning world, before it lets RRT answer (see
+#: `try_grasp`). Env `MIKASA_GRASP_TOUCH_RETRY=0` restores the plain call.
+GRASP_TOUCH_RETRY = os.environ.get("MIKASA_GRASP_TOUCH_RETRY", "1") != "0"
+
 #: TOPP limits the solver plans the ARM under when the env is in `pd_joint_delta_pos`
 #: (`default_planner_factory`), for a probe: 0 (the default) keeps the solver's own.
+#: Control step at or above which the clock counts as SLOW and plans are timed down (see
+#: `default_planner_factory`): 0.09 s catches the dataset's 10 Hz and leaves the tasks' own
+#: 20 Hz (0.05 s) exactly as measured.
+SLOW_CLOCK_TIMESTEP = float(os.environ.get("MIKASA_SLOW_CLOCK_TIMESTEP", "0.09"))
+SLOW_CLOCK_VEL_LIMIT = float(os.environ.get("MIKASA_SLOW_CLOCK_VEL", "0.45"))
+#: `MikasaFetchSolver`'s own default, for the cap above to compare against.
+SOLVER_DEFAULT_VEL_LIMIT = 0.9
+
 DELTA_JOINT_VEL_LIMIT = float(os.environ.get("MIKASA_DELTA_VEL", "0"))
 DELTA_JOINT_ACC_LIMIT = float(os.environ.get("MIKASA_DELTA_ACC", "0.9"))
 
@@ -177,6 +190,26 @@ def default_planner_factory(env, debug: bool, vis: bool, *, max_refine_steps: in
         joint_vel_limits = DELTA_JOINT_VEL_LIMIT
         if joint_acc_limits is None:
             joint_acc_limits = DELTA_JOINT_ACC_LIMIT
+    if getattr(env.unwrapped, "control_mode", None) == "pd_joint_delta_pos" \
+            and float(getattr(env.unwrapped, "control_timestep", 0.05)) >= SLOW_CLOCK_TIMESTEP:
+        # A SLOW control clock — the VLA dataset's 10 Hz (`evaluate_planner --control-freq
+        # 10`). An action is a delta per control STEP, bounded at 0.1 rad however long the
+        # step lasts, so a path timed for the solver's default 0.9 asks the channel for
+        # more than it can carry and the recorded actions sit at the clip. Measured
+        # 2026-09-10 at 10 Hz, arm clip fraction / episode steps:
+        #   Retrieval 1100     0.9 -> 0.107      0.6 -> 0.000 (327)   0.45 -> 0.000 (341)
+        #   SeasonDish 3600    0.9 -> 0.200      0.6 -> 0.005 (436)   0.45 -> 0.000 (490)
+        #   CabinetSearch 2367 0.9 -> 0.028      0.6 -> 0.028 (1850)  0.45 -> 0.000 (2012)
+        # At 0.6 the clipped steps were genuine motion — the plan asking 0.1 rad where the
+        # PD delivers 0.063 — so the cap is 0.45: every task clips nothing and the
+        # episodes grow 4-9 %. A CAP rather than a
+        # default, because the oracles set the limit themselves (SeasonDish passes 0.9 —
+        # `JOINT_LIMIT_SCALE` — and kept clipping a fifth of its steps until this capped
+        # it). Keyed on the clock, not on the mode, so the tasks' own 20 Hz (0.05 s,
+        # 0.038 rad/step, no clip) is untouched — and the 2026-09-09 finding above (0.6 at
+        # 20 Hz put Retrieval's stage ends on joint limits) is about a step half as long.
+        joint_vel_limits = min(SOLVER_DEFAULT_VEL_LIMIT if joint_vel_limits is None
+                               else float(joint_vel_limits), SLOW_CLOCK_VEL_LIMIT)
     return MikasaFetchSolver(
         env,
         debug=debug,
@@ -236,8 +269,14 @@ def wait_cue(env, planner, info, who: str = "oracle"):
     return info
 
 
-def grasp_geometry(task, obb, ee_direction, target_closing, grasp_info=default_grasp_info):
+def grasp_geometry(task, obb, ee_direction, target_closing, grasp_info=default_grasp_info, standoff: float = 0.1):
     """(grasp_pose, reach_pose) for the object, with the far-side flip of myrobocasa_planner.py:100-120.
+
+    `standoff`: metres the reach (pre-grasp) pose stands back from the grasp along the
+    approach axis. 0.10 as inherited; SeasonDish passes 0.15 since 2026-09-09 — the
+    approach to the standoff is a joint-space line whose hand path curves past the
+    object, and at 10 cm the delta controller's tracking put a finger on the shaker
+    (3608, step 107); the last stretch into the grasp is a screw, straight by construction.
 
     Example:
         >>> grasp, reach = grasp_geometry(task, obb, ee_dir, closing)  # doctest: +SKIP
@@ -245,7 +284,7 @@ def grasp_geometry(task, obb, ee_direction, target_closing, grasp_info=default_g
     """
     info = grasp_info(obb, ee_direction, target_closing)
     grasp = task.agent.build_grasp_pose(info["approaching"], info["closing"], info["center"])
-    reach = grasp * sapien.Pose([0, 0, -0.1])
+    reach = grasp * sapien.Pose([0, 0, -float(standoff)])
 
     base_pos = _np(task.agent.base_link.pose.p)[0]
     obj_center = np.asarray(obb.center_mass)
@@ -253,7 +292,7 @@ def grasp_geometry(task, obb, ee_direction, target_closing, grasp_info=default_g
         # The reach pose is on the far side of the object from the base: flip.
         info = grasp_info(obb, -ee_direction, target_closing)
         grasp = task.agent.build_grasp_pose(info["approaching"], info["closing"], info["center"])
-        reach = grasp * sapien.Pose([0, 0, -0.1])
+        reach = grasp * sapien.Pose([0, 0, -float(standoff)])
     return grasp, reach
 
 
@@ -543,8 +582,33 @@ def try_grasp(env, planner, task, obj, grasp, reach, *, keepout_actors=None, kee
     gstretch = {}
     if int(grasp_stretch) > 1 and "stretch" in _params:
         gstretch = {"stretch": int(grasp_stretch)}
-    res = planner.static_manipulation(grasp, disable_lift_joint=bool(freeze_torso), **ik, **gtouch, **gknots,
-                                      **gstretch, **{k: v for k, v in draws.items() if k == "skim_cap"})
+    skim = {k: v for k, v in draws.items() if k == "skim_cap"}
+    res = -1
+    if GRASP_TOUCH_RETRY and "max_knots" in _params and "knot_refuse" in _params:
+        # The grasp leg's screw ends IN contact with the object by construction (the
+        # fingers close around it), and the planning world refuses the last hair of it
+        # when the finger's box meets the object's hull a millimetre early — then RRT
+        # answers with a detour under the knot cap and the detour sweeps the object
+        # (SeasonDish 3608 in pd_joint_delta_pos, 2026-09-09: 35 knots, the shaker
+        # knocked 12 cm; the same seed's screw passes in pd_joint_pos by a hair).
+        # So: the straight plans only (no RRT); refused, the same straight plan with
+        # the object out of the planning world (`touchable`) — the sim still collides,
+        # that IS the grasp, and `stop_on_touch` still stops the stroke; only then the
+        # plain call with its RRT fallback as before.
+        straight = dict(gknots); straight.update(max_knots=1, knot_draws=1, knot_refuse=True)
+        res = planner.static_manipulation(grasp, disable_lift_joint=bool(freeze_torso), **ik, **gtouch,
+                                          **straight, **gstretch, **skim)
+        if res == -1 and getattr(planner, "planner", None) is not None:
+            say(env, "oracle", "grasp stroke refused straight; retrying with the object touchable",
+                obj=getattr(obj, "name", "?"))
+            with touchable(planner, str(getattr(obj, "name", ""))):
+                res = planner.static_manipulation(grasp, disable_lift_joint=bool(freeze_torso), **ik, **gtouch,
+                                                  **straight, **gstretch, **skim)
+        if res != -1 and stopped_by_horizon(planner):
+            return res, False
+    if res == -1:
+        res = planner.static_manipulation(grasp, disable_lift_joint=bool(freeze_torso), **ik, **gtouch, **gknots,
+                                          **gstretch, **skim)
     if res == -1 and full_dof_reach and callable(
             getattr(planner, "move_to_pose_with_RRTConnect", None)):
         # K101 applies to the descend too: after a planning reach, the short grasp
@@ -979,7 +1043,134 @@ class _Tee(io.TextIOBase):
         return True
 
 
-def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False) -> bool:
+def roll_room(planner):
+    """`planner.roll_room()` — the roll joints' planning limits widened to the simulator's
+    for the plans inside — or a no-op for a solver (a test double) without it.
+
+    Open it only for a motion that IS a roll, and only when every plan after it is
+    under it too: a leg planned inside the room can leave a roll joint outside the
+    window, and every later plan then clips the start qpos back into it, so the
+    model's forward kinematics disagree with the simulator (SeasonDish 3811,
+    2026-09-09: 0.2 m and 4 deg apart, and the next drive chased an unreachable goal).
+
+    Example:
+        >>> with roll_room(planner):                       # doctest: +SKIP
+        ...     res = common.arm_move(env, planner, pour_pose, who=WHO, stage="pour")
+    """
+    ctx = getattr(planner, "roll_room", None)
+    return ctx() if callable(ctx) else contextlib.nullcontext()
+
+
+def head_look_at(planner, point):
+    """`planner.look_at(point)` — the drives inside hold the head toward `point` (world
+    xyz) — or a no-op for a solver (a test double) without it.
+
+    Example:
+        >>> with head_look_at(planner, bowl_p):                                    # doctest: +SKIP
+        ...     res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True)
+    """
+    ctx = getattr(planner, "look_at", None)
+    return ctx(point) if callable(ctx) else contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def screw_tolerance(planner, tol):
+    """The screw's arrival gate (`ARM_SCREW_GOAL_TOLERANCE`, metres and radians) set on
+    THIS solver instance for the plans inside — `static_manipulation` and the K61 probe
+    both read the attribute, so the probe still mirrors the execution. For a leg whose
+    target has slack by construction: SeasonDish's lift (2026-09-09, 3811) only has to
+    clear the neighbour, and its screw was refused with the knot before the stop 2.5 cm
+    short of a target 3 cm above the floor. Restored on exit.
+
+    Args:
+        tol: `(metres, radians)` — the arrival gate for the plans inside.
+
+    Example:
+        >>> with screw_tolerance(planner, (0.03, 0.10)):    # doctest: +SKIP
+        ...     ok = screw_plans(planner, rung_pose, disable_lift_joint=True)
+    """
+    had = "ARM_SCREW_GOAL_TOLERANCE" in vars(planner)
+    saved = vars(planner).get("ARM_SCREW_GOAL_TOLERANCE")
+    try:
+        planner.ARM_SCREW_GOAL_TOLERANCE = tuple(tol)
+    except Exception:  # a double that forbids attributes
+        yield
+        return
+    try:
+        yield
+    finally:
+        if had:
+            planner.ARM_SCREW_GOAL_TOLERANCE = saved
+        else:
+            try:
+                del planner.ARM_SCREW_GOAL_TOLERANCE
+            except AttributeError:
+                pass
+
+
+@contextlib.contextmanager
+def allow_held_contacts(env, planner, stems, who: str, stage: str):
+    """Allow, in the planning world's collision matrix, the contacts a HELD object makes at
+    the start with non-robot objects — the counter it still stands on — for the plans
+    inside; removed on exit.
+
+    mplib will not plan out of a start it calls colliding: the RRT prints `Invalid start
+    state!`, perturbs the start and answers with a two-knot path (SeasonDish 3811,
+    2026-09-09: the bottle, just grasped, rests on the counter in the model; the lift's
+    four RRT draws all started that way and the executed one twisted the forearm 0.7 rad
+    while the torso rose, ripping the bottle out of the pinch). The contact is real and
+    harmless — the object is in the hand and about to leave the surface — the same
+    reasoning as `hold_object_in_planner(extra_touch=)` for the object against the arm.
+    Pairs are found by asking the planning world what collides NOW, so nothing is allowed
+    that the start does not already touch; robot-link pairs are left alone.
+
+    Args:
+        stems: substrings naming the held object(s) in the planning world (e.g. "shaker").
+
+    Yields:
+        The pairs allowed, as `(name_a, name_b)` — empty when the solver is a double
+        or nothing collides at the start.
+
+    Example:
+        >>> with allow_held_contacts(env, planner, ("shaker",), who=WHO, stage="lift") as pairs:  # doctest: +SKIP
+        ...     res = common.arm_move(env, planner, lift_pose, who=WHO, stage="lift")
+    """
+    inner = getattr(planner, "planner", None)
+    world = getattr(inner, "planning_world", None)
+    if world is None or not callable(getattr(world, "check_collision", None)):
+        yield []
+        return
+    pairs = []
+    try:
+        inner.update_from_simulation()
+        for c in world.check_collision():
+            n1, n2 = str(c.link_name1), str(c.link_name2)
+            if ("fetch" in n1) or ("fetch" in n2):
+                continue
+            if any(s in n1 or s in n2 for s in stems):
+                pairs.append((n1, n2))
+        acm = world.get_allowed_collision_matrix()
+        for n1, n2 in pairs:
+            acm.set_entry(n1, n2, True)
+    except Exception as exc:  # the probe must never lose a leg
+        say(env, who, f"{stage}: could not read the model's contacts", why=f"{type(exc).__name__}: {exc}"[:120])
+        pairs = []
+    if pairs:
+        say(env, who, f"{stage}: the held object touches the model's world at the start; allowing that contact",
+            pairs=[f"{a.split('_', 1)[-1]}<->{b.split('_', 1)[-1]}" for a, b in pairs])
+    try:
+        yield pairs
+    finally:
+        if pairs:
+            try:
+                acm = world.get_allowed_collision_matrix()
+                for n1, n2 in pairs:
+                    acm.remove_entry(n1, n2)
+            except Exception:
+                pass
+
+
+def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False, want_result: bool = False):
     """Would `static_manipulation(target)` reach this pose by a **straight** screw? (K61)
 
     `static_manipulation` tries `plan_screw` and falls back to RRTConnect without
@@ -1001,11 +1192,13 @@ def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False) -
         planner: the solver (needs `.planner`, `.robot`, `.base_env`).
         target_tcp_pose: the TCP pose to test, `sapien.Pose`.
         disable_lift_joint: as passed to `static_manipulation`.
+        want_result: return the screw's result dict (its `position` knots included)
+            instead of a bool — None when it did not plan.
 
     Returns:
         True if `plan_screw` reports `Success`, False otherwise (a refusal, or any
         solver that does not expose the mplib planner — the caller then just runs its
-        candidates in their normal order).
+        candidates in their normal order); with `want_result`, the dict or None.
 
     Example:
         >>> ordered = sorted(cands, key=lambda c: not screw_plans(planner, pose_of(c)))  # doctest: +SKIP
@@ -1014,7 +1207,7 @@ def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False) -
     robot = getattr(planner, "robot", None)
     base_env = getattr(planner, "base_env", None)
     if inner is None or robot is None or base_env is None:
-        return False
+        return None if want_result else False
     try:
         import mplib  # lazy: this module stays importable without mplib (offline tests)
 
@@ -1026,9 +1219,33 @@ def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False) -
             masked_joints=~np.array(only_manipulate),
             goal_tolerance=getattr(planner, "ARM_SCREW_GOAL_TOLERANCE", None),
         )
-        return str(result.get("status", "")) == "Success"
+        ok = str(result.get("status", "")) == "Success"
+        if not ok:
+            # The solver's unjam retry (ARM_SCREW_UNJAM): a screw stopped by a joint's stop
+            # is planned once more with that joint held. Mirrored here since 2026-09-09 —
+            # without it the probe called 3608's pour "no straight candidate" while the
+            # execution planned it by screw (`unjam=7`), and the ordering was blind.
+            from utils.mikasa_oracle.motionplanning.fetch.extand import ARM_SCREW_UNJAM, screw_jammed_joints
+            jammed = [j for j in screw_jammed_joints(result.get("status", ""))
+                      if 0 <= j < len(only_manipulate)]
+            if ARM_SCREW_UNJAM and jammed:
+                held = list(only_manipulate)
+                for j in jammed:
+                    held[j] = True
+                retry = inner.plan_screw(
+                    mplib.Pose(p=np.asarray(target_tcp_pose.p), q=np.asarray(target_tcp_pose.q)),
+                    robot.get_qpos().cpu().numpy()[0],
+                    time_step=base_env.control_timestep,
+                    masked_joints=~np.array(held),
+                    goal_tolerance=getattr(planner, "ARM_SCREW_GOAL_TOLERANCE", None),
+                )
+                if str(retry.get("status", "")) == "Success":
+                    result, ok = retry, True
+        if want_result:
+            return result if ok else None
+        return ok
     except Exception:  # a stub planner, or an mplib that refuses the probe
-        return False
+        return None if want_result else False
 
 
 @contextlib.contextmanager
@@ -1406,6 +1623,7 @@ def carry_pose(
     env, planner, task, obj, who: str = "oracle", *, ahead: float = 0.25, after: str | None = None,
     yaws_deg=CARRY_YAWS_DEG, lifts_m=CARRY_LIFTS_M,
     upright: bool = False, legs: int = 1, max_knots=None, knot_draws: int = 1,
+    knot_refuse: bool = False, by_line: bool = False,
 ):
     """Bring the held object into a carry pose over the base before driving (K52/D12).
 
@@ -1455,6 +1673,12 @@ def carry_pose(
         legs: above 1 the tuck is broken into short hops via `move_via`.
         max_knots: the K58 redraw knife — forwarded to the solver.
         knot_draws: the K58 redraw knife — forwarded to the solver.
+        knot_refuse: with `max_knots`, refuse an RRT answer over the cap instead of
+            executing the shortest draw (2026-09-09: a straight-only tuck pass).
+        by_line: ask the solver for a joint LINE to the nearest IK solution first
+            (`static_manipulation(by_line=True)`): the tuck as one monotone joint
+            motion, no roll winding, where the screw to the same pose wound the
+            upperarm and forearm rolls by +2 rad each (SeasonDish, the yaw-90 carry).
 
     Example:
         >>> res = carry_pose(env, planner, task, task.cup, who="burner_planner")  # doctest: +SKIP
@@ -1557,7 +1781,9 @@ def carry_pose(
                              max_knots=max_knots, knot_draws=knot_draws)
                     if legs > 1
                     else planner.static_manipulation(
-                        target, disable_lift_joint=True, **_knot_kw(max_knots, knot_draws)
+                        target, disable_lift_joint=True,
+                        **_knot_kw(max_knots, knot_draws, knot_refuse),
+                        **({"by_line": True} if by_line else {}),
                     )
                 )
                 if res != -1 and stopped_by_horizon(planner):
