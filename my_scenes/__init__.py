@@ -18,3 +18,6 @@ __all__ = [
 from .cabinet_retrieval import CabinetRetrievalTask  # noqa: F401
 from .cabinet_search import CabinetSearchTask  # noqa: F401
 from .season_dish import SeasonDishTask  # noqa: F401
+
+from .water_plants import WaterPlantsTask  # noqa: F401
+from .depth_recall_v1 import DepthRecallV1Task  # noqa: F401

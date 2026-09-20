@@ -42,6 +42,14 @@ from utils.mikasa_oracle.motionplanning.fetch.stepping import pose_error
 #: is accepted at its previous knot when that knot is within the goal tolerance — see
 #: `plan_screw` (SeasonDish 1957, 2026-09-06). 0 disables.
 SCREW_ARRIVAL_SLACK = float(os.environ.get("MIKASA_SCREW_ARRIVAL_SLACK", "0.01"))
+#: How many times `plan_screw` re-linearizes the twist when it has integrated the whole
+#: twist and the FK of its last knot is still outside the caller's tolerance (2026-09-09).
+#: The twist is integrated to first order in a frame fixed at the start, so a long move
+#: — the 165 deg pour tilt, a hover from a folded arm — "converges" 2–4 cm from the goal
+#: and was refused, and the RRT that replaced it wound the whole arm. A round recomputes
+#: the remaining twist from where the path actually stands and keeps integrating; the
+#: path stays one screw-shaped joint-space curve. 0 = the old single pass.
+SCREW_RELINEARIZE_ROUNDS = int(os.environ.get("MIKASA_SCREW_RELINEARIZE", "3"))
 SCREW_ARRIVAL_SLACK_M = 0.01
 SCREW_ARRIVAL_SLACK_RAD = 0.05
 from utils.mikasa_oracle.motionplanning.fetch.root_frame import (
@@ -84,6 +92,37 @@ def wrappable(joint_limits) -> np.ndarray:
     """
     lim = np.asarray(joint_limits, dtype=float)
     return (lim[:, 1] - lim[:, 0]) > (TWO_PI + WRAP_MARGIN)
+
+
+def roll_cols(joint_limits, names=None) -> list:
+    """Columns of the arm's ROLL joints, by name when the caller knows them.
+
+    `names` — one per row of `joint_limits` — is the reliable answer and the one to
+    prefer: since the URDF went back to the stock +-3.141 (2026-09-10) a roll joint
+    spans exactly one turn, so the span rule below finds nothing, and the preference
+    that keeps the wrist away from the seam would go silent exactly where it is most
+    needed (the seam is now real: the pre-hover screw refuses with `joint limit at
+    index [8, 10]` on SeasonDish 3852).
+
+    Without names, fall back to the span: a widened roll joint spans more than one turn
+    and at most two (+-3.44 under a planner window, +-6.28 in a widened URDF), while the
+    virtual base joints — wrappable by the same arithmetic — span far more.
+
+        >>> import numpy as np
+        >>> lim = np.array([[-20., 20.], [-50., 50.], [-6.28, 6.28], [-3.141, 3.141]])
+        >>> roll_cols(lim)
+        [2]
+        >>> roll_cols(lim, ["root_x_axis_joint", "root_z_rotation_joint",
+        ...                 "shoulder_pan_joint", "wrist_roll_joint"])
+        [3]
+    """
+    if names is not None:
+        return [i for i, n in enumerate(names)
+                if str(n).endswith("_roll_joint") and not str(n).startswith("root")]
+    lim = np.asarray(joint_limits, dtype=float)
+    span = lim[:, 1] - lim[:, 0]
+    return [i for i in range(len(span))
+            if TWO_PI + WRAP_MARGIN < span[i] <= 2 * TWO_PI + WRAP_MARGIN]
 
 
 def unwrap_toward(goal, current, joint_limits):
@@ -141,6 +180,134 @@ def goal_order(goals, current):
         return float(np.abs(g[:n] - current[:n]).max())
 
     return sorted((np.asarray(g, dtype=float) for g in goals), key=cost)
+
+
+#: How far a roll joint may be turned in a goal we prefer, radians. **OFF by default
+#: since 2026-09-10**, and the reason is a measurement, not a principle.
+#:
+#: What it was built for. While our URDF widened the roll joints to +-6.28 (mplib refuses
+#: a `continuous` joint), an IK goal could legally sit past +-pi — a posture an
+#: unmodified Fetch cannot hold — and 36 of 200 SeasonDish recordings came out
+#: unreplayable outside this fork. Preferring goals with the rolls inside 2.6 rad, plus
+#: the pour's own direction preference and one extra IK try, took that to 15 of 200 with
+#: success untouched at 199/200.
+#:
+#: Why it is off. The owner then took the URDF back to the stock +-3.141 (so nothing has
+#: to be synchronised with jezvgg), which makes every recording stock-replayable by
+#: construction and leaves this preference with only its side effects. Measured on 200
+#: SeasonDish seeds at 10 Hz, everything else equal:
+#:
+#:     margin 0 (off)   198/200     margin 2.6   197/200     margin 2.9   198/200
+#:
+#: It trades seeds rather than winning them: 2.6 rescues 3852 and 3903 and loses 3855,
+#: 3904 and 3984 — deterministically, three runs each. "Small |roll|" is not the same as
+#: "room in the direction the next screw turns", which is what the pre-hover actually
+#: needs, and nothing at grasp time knows that direction. Kept, off, and documented
+#: because a tree that widens the URDF again needs it.
+ROLL_SEAM_MARGIN = float(os.environ.get("MIKASA_ROLL_SEAM_MARGIN", "0"))
+
+
+#: IK restarts for the SECOND try, made only when the first try offers no goal on the
+#: near side of the seam (`ik_seam_goals`). K79n measured 100 restarts everywhere as five
+#: seeds worse — the extra solutions are contorted postures that grasp marginally — so
+#: they are asked for only where the alternative is a recording a stock Fetch cannot
+#: replay, and they are used only if they actually produce a stock-safe goal. 0 = off.
+SEAM_RETRY_N_INIT = int(os.environ.get("MIKASA_SEAM_RETRY_N_INIT", "100"))
+
+
+def past_the_seam(goal, joint_limits, margin=None, names=None) -> bool:
+    """Does `goal` turn a roll joint further than `margin` (see `seam_first`)?"""
+    margin = ROLL_SEAM_MARGIN if margin is None else float(margin)
+    if margin <= 0:
+        return False
+    g = np.asarray(goal, dtype=float)
+    return any(abs(float(g[i])) > margin for i in roll_cols(joint_limits, names) if i < len(g))
+
+
+def limit_joint_names(planner) -> list | None:
+    """Joint names in the row order of `planner.joint_limits`, or None when the planner
+    (a double in the tests) cannot say. `joint_limits` is indexed by move-group position,
+    so the names come through `move_group_joint_indices`."""
+    try:
+        names = list(planner.user_joint_names)
+        return [names[i] for i in planner.move_group_joint_indices]
+    except Exception:
+        return None
+
+
+def ik_seam_goals(planner, goal_pose, current_qpos, mask, n_init_qpos, *, margin=None):
+    """`(status, goals)` — IK's solutions, unwrapped, nearest first, seam-first.
+
+    When the best of them still turns a roll joint past the seam, IK is asked a second
+    time with `SEAM_RETRY_N_INIT` restarts, and that set replaces the first ONLY if its
+    own best goal is on the near side. 2026-09-10, SeasonDish 3811: 20 restarts return a
+    single goal with `forearm_roll` at -3.34 (2.95 unwrapped), 100 return six, the best
+    with 0.38 — and the episode ends inside the stock limits instead of at 3.50.
+    """
+    names = limit_joint_names(planner)
+    status, goal_qpos = planner.IK(goal_pose, current_qpos, mask,
+                                   **({} if n_init_qpos is None else {"n_init_qpos": int(n_init_qpos)}))
+    if status != "Success" or goal_qpos is None or len(np.atleast_2d(goal_qpos)) == 0:
+        return status, []
+
+    def prepared(raw):
+        goals = [unwrap_toward(np.asarray(g, dtype=float), current_qpos, planner.joint_limits)
+                 for g in np.atleast_2d(raw)]
+        return seam_first(goal_order(goals, current_qpos), planner.joint_limits,
+                          margin=margin, names=names)
+
+    order = prepared(goal_qpos)
+    if (SEAM_RETRY_N_INIT > 0 and order
+            and past_the_seam(order[0], planner.joint_limits, margin, names)
+            and int(n_init_qpos or 20) < SEAM_RETRY_N_INIT):
+        st2, raw2 = planner.IK(goal_pose, current_qpos, mask, n_init_qpos=SEAM_RETRY_N_INIT)
+        if st2 == "Success" and raw2 is not None and len(np.atleast_2d(raw2)):
+            order2 = prepared(raw2)
+            if order2 and not past_the_seam(order2[0], planner.joint_limits, margin, names):
+                return status, order2
+    return status, order
+
+
+def seam_first(goals, joint_limits, margin=None, names=None):
+    """`goals` with those that keep every wrappable joint inside +-`margin` first.
+
+    A stable partition, not a re-sort: whatever order came in (``goal_order``'s
+    nearest-first) is preserved inside each half, so this only breaks the tie
+    ``goal_order`` never had an opinion about — which of two reachable postures to
+    prefer when both are legal here but only one is legal on a stock Fetch. When no
+    goal is inside the margin, nothing moves and no plan is lost.
+
+    Only the wrist ROLL columns are looked at (``roll_cols``): those are the joints
+    whose angle is a choice rather than a fact. The virtual base is deliberately not
+    among them — its yaw column is folded to a multiple of a turn away from zero
+    (-42.41 rad on SeasonDish 3852) and would put every goal past any margin, which is
+    exactly the bug that made the first version of this a no-op.
+
+        >>> import numpy as np
+        >>> lim = np.array([[-3.44, 3.44], [-1.5, 1.5]])
+        >>> g = [np.array([3.3, 0.2]), np.array([-0.5, 0.9])]
+        >>> [float(x[0]) for x in seam_first(g, lim)]
+        [-0.5, 3.3]
+        >>> [float(x[0]) for x in seam_first(g, lim, margin=0)]   # off
+        [3.3, -0.5]
+        >>> base = np.array([[-50.0, 50.0], [-3.44, 3.44]])       # base yaw, then a roll
+        >>> g2 = [np.array([-42.4, 3.3]), np.array([-42.4, -0.5])]
+        >>> [float(x[1]) for x in seam_first(g2, base)]
+        [-0.5, 3.3]
+    """
+    margin = ROLL_SEAM_MARGIN if margin is None else float(margin)
+    goals = [np.asarray(g, dtype=float) for g in goals]
+    if margin <= 0 or len(goals) < 2:
+        return goals
+    cols = roll_cols(joint_limits, names)
+    if not cols:
+        return goals
+
+    def past_the_seam(g):
+        reach = [abs(float(g[i])) for i in cols if i < len(g)]
+        return int(bool(reach) and max(reach) > margin)
+
+    return sorted(goals, key=past_the_seam)
 
 
 def attach_object(  # type: ignore
@@ -939,6 +1106,7 @@ class SapienPlannerV2(SapienPlanner):
 
         move_joint_idx = self.move_group_joint_indices
         path = [np.copy(current_qpos[move_joint_idx])]
+        rounds = 0
 
         while True:
             self.pinocchio_model.compute_full_jacobian(current_qpos)
@@ -987,8 +1155,16 @@ class SapienPlannerV2(SapienPlanner):
             # twist left"). Collisions and limits still fail the arrival step.
             stalled = np.linalg.norm(delta_twist) < 1e-4 and not flag
             accepted_slack = False
+            # Eligible for the one-knot-short arrival when the twist left is within the
+            # slack OR within the caller's own tolerance (2026-09-09: SeasonDish's lift
+            # met the roll window with 0.012 of the twist left and a 3 cm tolerance — the
+            # knot before was 1.2 cm short of a target the caller had 3 cm of room on,
+            # and it was refused for the 0.01 gate alone).
+            slack_gate = SCREW_ARRIVAL_SLACK
+            if goal_tolerance is not None:
+                slack_gate = max(slack_gate, float(goal_tolerance[0]))
             if (collide or not within_joint_limit) and not stalled and len(path) >= 2 \
-                    and float(np.linalg.norm(omega)) <= SCREW_ARRIVAL_SLACK:
+                    and float(np.linalg.norm(omega)) <= slack_gate:
                 # SeasonDish 1957 (2026-09-06): the standoff->grasp screw was refused
                 # `forearm_roll_link <-> counter` with **0.005 of the twist left** — the
                 # last hair of a 10 cm descent — and the RRT that replaced a straight
@@ -1062,6 +1238,17 @@ class SapienPlannerV2(SapienPlanner):
                 self.pinocchio_model.compute_forward_kinematics(current_qpos)
                 ee_pose = self.pinocchio_model.get_link_pose(ee_index)
                 goal_error = pose_error(goal_pose.p, goal_pose.q, ee_pose.p, ee_pose.q)
+                if goal_tolerance is not None and (
+                    goal_error[0] > goal_tolerance[0] or goal_error[1] > goal_tolerance[1]
+                ) and rounds < SCREW_RELINEARIZE_ROUNDS and iterations < max_iters and not accepted_slack:
+                    # Re-linearize: the twist that remains, seen from where the path stands.
+                    rel = goal_pose * ee_pose.inv()
+                    om2, th2 = pose2exp_coordinate(rel)
+                    if th2 > -1e4:
+                        omega = om2.reshape((-1, 1)) * th2
+                        rounds += 1
+                        flag = False
+                        continue
                 if goal_tolerance is not None and (
                     goal_error[0] > goal_tolerance[0] or goal_error[1] > goal_tolerance[1]
                 ):
@@ -1156,27 +1343,21 @@ class SapienPlannerV2(SapienPlanner):
         # we need to take only the move_group joints when planning
         # idx = self.move_group_joint_indices
 
-        ik_status, goal_qpos = self.IK(goal_pose, current_qpos, mask, n_init_qpos=n_init_qpos, verbose=True)
-        if ik_status != "Success":
+        # K55 / D14. IK hands back a goal wrapped into [-pi, pi]. Where a joint's
+        # range is wider than one turn, the same wrist pose is also reachable at
+        # g +- 2pi, and one of those is far nearer the pose the arm is already in --
+        # the difference between a 29 deg move and a 331 deg unwind. `ik_seam_goals`
+        # does that unwrapping, the nearest-first order, and the preference for a
+        # posture a stock Fetch could hold too; `goal_order`'s first goal is then tried
+        # on its own before the whole set, so a plan is never lost to the preference.
+        ik_status, order = ik_seam_goals(self, goal_pose, current_qpos, mask, n_init_qpos)
+        if ik_status != "Success" or not order:
             return {"status": ik_status}
 
         if verbose:
             print("IK results:")
-            for i in range(len(goal_qpos)):  # type: ignore
-                print(goal_qpos[i])  # type: ignore
-
-        # K55 / D14. IK hands back a goal wrapped into [-pi, pi]. Where a joint's
-        # range is wider than one turn, the same wrist pose is also reachable at
-        # g +- 2pi, and one of those is far nearer the pose the arm is already in --
-        # the difference between a 29 deg move and a 331 deg unwind. `unwrap_toward`
-        # rewrites each goal to the nearest equivalent; `goal_order` then tries the
-        # closest goal on its own before falling back to the whole set, so a plan is
-        # never lost to the preference.
-        goals = [
-            unwrap_toward(np.asarray(g, dtype=float), current_qpos, self.joint_limits)
-            for g in np.atleast_2d(goal_qpos)
-        ]
-        order = goal_order(goals, current_qpos)
+            for g in order:
+                print(g)
 
         rest = dict(
             time_step=time_step,

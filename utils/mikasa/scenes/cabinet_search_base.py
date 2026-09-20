@@ -107,35 +107,34 @@ TASK_STATE_OPTIONAL = ("seen_count", "cube_spawn")
 #: an unstated rule with an instant fail would fail an agent that follows the
 #: instruction literally (review finding).
 INSTRUCTIONS = (
-    "Find the cube hidden in the wall cabinets. Go to the marked spot on the "
-    "floor before opening any cabinet, close each cabinet you open, and "
-    "return to the mark before opening the next. Never open a cabinet you "
-    "have already opened.",
-    "A cube is hidden in the wall cabinets. Starting from the floor mark, "
-    "open cabinets to look for it; close the cabinet behind you and come "
-    "back to the mark before trying another. Do not open a cabinet you "
-    "already opened.",
-    "Search the wall cabinets for the cube. Every search starts at the "
-    "marked spot: shut each cabinet after looking and head back to the mark "
-    "before the next. Opening the same cabinet again fails the task.",
+    "A red cube is hidden in a wall cabinet. Start from the yellow mark on the floor. "
+    "Open a cabinet and look inside; if the cube is not there, close that cabinet, go "
+    "back to the yellow mark and try another. Never open the same cabinet again.",
+    "Find the cube hidden in the wall cabinets. Before opening any cabinet, stand on the "
+    "yellow floor mark; close each cabinet you open and return to the mark before opening "
+    "the next. Do not open a cabinet you have already opened.",
+    "Search the wall cabinets for the hidden red cube, starting from the yellow mark on "
+    "the floor: open a cabinet, look; if the cube is not there close the door, come back "
+    "to the mark and choose a different cabinet. A cabinet you have opened must not be "
+    "opened again.",
 )
 
 #: The same three under the touch terminal (`cfg.terminal == "nudge"`): the goal
 #: is STATED — the episode ends on a push of the cube, and a policy that only
 #: looks would wait out the horizon without being told why. Same word rules.
 INSTRUCTIONS_NUDGE = (
-    "Find the cube hidden in the wall cabinets and nudge it when you find it. "
-    "Go to the marked spot on the floor before opening any cabinet, close "
-    "each cabinet you open, and return to the mark before opening the next. "
-    "Never open a cabinet you have already opened.",
-    "A cube is hidden in the wall cabinets. Starting from the floor mark, "
-    "open cabinets to look for it and give it a push when you see it; close "
-    "the cabinet behind you and come back to the mark before trying another. "
-    "Do not open a cabinet you already opened.",
-    "Search the wall cabinets for the cube and push it when you find it. "
-    "Every search starts at the marked spot: shut each cabinet after looking "
-    "and head back to the mark before the next. Opening the same cabinet "
-    "again fails the task.",
+    "A red cube is hidden in a wall cabinet. Start from the yellow mark on the floor. "
+    "Open a cabinet and look inside; if the cube is there, give it a push. If not, close "
+    "that cabinet, go back to the yellow mark and try another. Never open the same "
+    "cabinet again.",
+    "Find the cube hidden in the wall cabinets and nudge it when you see it. Before "
+    "opening any cabinet, stand on the yellow floor mark; close each cabinet you open and "
+    "return to the mark before opening the next. Do not open a cabinet you have already "
+    "opened.",
+    "Search the wall cabinets for the hidden red cube, starting from the yellow mark on "
+    "the floor: open a cabinet, look, push the cube if it is there; otherwise close the "
+    "door, come back to the mark and choose a different cabinet. A cabinet you have "
+    "opened must not be opened again.",
 )
 
 #: The W13-measured graspable depth band on the cabinet shelf (y, world). The
@@ -1846,10 +1845,20 @@ class CabinetSearchTaskBase(BaseEnv):
     # ------------------------------------------------------------- the look --
 
     def _look_cameras(self) -> list:
-        """(uid, mount pose) of the base cameras on the head link, from the agent's rig."""
+        """(uid, mount pose) of the cameras on the head link, from the agent's rig.
+
+        Every camera mounted on `head_camera_link`, whatever it is called. The name
+        used to be filtered for `base_camera`, from when the rig's only head-link
+        cameras were the two shoulder ones; after those were rolled back
+        (2026-09-10, "откати их к реальному fetch") that filter matched NOTHING, and
+        `_cube_seen`'s empty-list branch reads an empty rig as "seen" — so the `seen`
+        terminal silently stopped requiring a look. The real head camera
+        (`fetch_head`, mounted at the link's origin) is the one this terminal is
+        about; the shoulder pair still counts when MIKASA_SHOULDER_CAMERAS=1 brings
+        it back."""
         out = []
         for c in getattr(self.agent, "_sensor_configs", []) or []:
-            if getattr(c, "entity_uid", None) == "head_camera_link" and "base_camera" in c.uid:
+            if getattr(c, "entity_uid", None) == "head_camera_link":
                 out.append((c.uid, c.pose))
         return out
 
@@ -1878,6 +1887,15 @@ class CabinetSearchTaskBase(BaseEnv):
         cams = self._look_cameras()
         head = getattr(getattr(self.agent, "robot", None), "links_map", {}).get("head_camera_link")
         if not cams or head is None:
+            # Only reachable off the `seen` terminal (the offline latch traces call
+            # `step_search_latches` with cube_seen=None and never come here). Under
+            # `seen` an all-True answer would hand out success for never looking, so
+            # say so instead of degrading in silence.
+            if getattr(self.cfg, "terminal", "nudge") == "seen":
+                raise RuntimeError(
+                    "the 'seen' terminal needs a camera on head_camera_link; the rig "
+                    f"has {[c.uid for c in getattr(self.agent, '_sensor_configs', []) or []]}"
+                )
             return torch.ones((n,), dtype=torch.bool, device=self.device)
         cube_p = self.cube.pose.p
         seen = torch.zeros((n,), dtype=torch.bool, device=self.device)

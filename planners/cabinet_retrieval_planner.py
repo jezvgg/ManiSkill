@@ -1,8 +1,17 @@
 """Scripted oracle for MikasaCabinetRetrieval-v0: side-grasp the cup off the cabinet
 shelf through the open door, carry it down, stand it on the counter.
 
-Every stage is the W13 chain (tools/probes/w13_cabinet_take.py, journal 2026-08-28),
-which is the measurement this oracle exists to reproduce under the task's own reset:
+Since 2026-09-09 the manipulation is the STRAIGHT flow (`take_and_place_straight`,
+the owner's direction: raise the torso, take by a straight line, place by a straight
+line): every arm move a joint line or a screw, the reach into the cabinet and the
+carry out of it the base driving straight with the arm held. The W13 chain below is
+kept verbatim as `take_and_place_legacy` (`MIKASA_RETRIEVAL_STRAIGHT=0`); its grasp
+geometry (the side grasp, the depths, the +3 cm unshelve) is what the straight flow
+executes too.
+
+Every stage of the legacy chain is W13 (tools/probes/w13_cabinet_take.py, journal
+2026-08-28), which is the measurement this oracle exists to reproduce under the task's
+own reset:
 
 - the VERTICAL top grasp never plans through the opening (0/9 honest cells), so the
   grasp here is the horizontal side grasp — approach along +y into the cabinet,
@@ -28,6 +37,7 @@ byte-identical to K105–K108.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import os
@@ -779,8 +789,8 @@ def _b(info, key) -> bool:
     return bool(_np(info[key]).reshape(-1)[0])
 
 
-def side_grasp_pose(task, depth: float):
-    """The side-grasp TCP pose for the cup where it stands NOW, plus its pre-grasp.
+def side_grasp_pose(task, depth: float, lift: float = 0.0, obj=None):
+    """The side-grasp TCP pose for the object where it stands NOW, plus its pre-grasp.
 
     Approach along +y (into the cabinet), closing across, TCP at the cup's
     mid-height `depth` metres past/short of the axis — the W13 winning geometry.
@@ -789,6 +799,11 @@ def side_grasp_pose(task, depth: float):
     Args:
         task: `env.unwrapped`.
         depth: metres along the approach past the cup's axis (negative = short).
+        lift: metres ABOVE the mid-height for the TCP (the straight flow's
+            GRASP_LIFT: the wrist_flex link hangs 6.7 cm under the hand's axis and
+            at the mid-height its underside is level with the shelf's top).
+        obj: which actor to grasp; None = `task.cup`, this family's single object.
+            `MikasaDepthRecall-v1` carries three and names the one it is on.
 
     Returns:
         `(grasp, pre)` sapien Poses, or `(None, None)` if the cup has no mesh.
@@ -796,12 +811,14 @@ def side_grasp_pose(task, depth: float):
     Example:
         >>> g, pre = side_grasp_pose(task, -0.005)                # doctest: +SKIP
     """
-    mesh = task.cup.get_first_collision_mesh(to_world_frame=True)
+    obj = task.cup if obj is None else obj
+    mesh = obj.get_first_collision_mesh(to_world_frame=True)
     if mesh is None:
         return None, None
     b = np.asarray(mesh.bounds, dtype=np.float64)
-    cup_p = _np(task.cup.pose.p).reshape(-1, 3)[0].astype(np.float64)
-    centre = np.array([cup_p[0], cup_p[1] + float(depth), (b[0][2] + b[1][2]) / 2.0])
+    cup_p = _np(obj.pose.p).reshape(-1, 3)[0].astype(np.float64)
+    centre = np.array([cup_p[0], cup_p[1] + float(depth),
+                       (b[0][2] + b[1][2]) / 2.0 + float(lift)])
     grasp = task.agent.build_grasp_pose(
         np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]), centre
     )
@@ -819,9 +836,64 @@ def side_grasp_pose(task, depth: float):
 #: set), so the torso ducks once and stays ducked.
 TORSO_DRIVE = 0.20
 
+#: The STRAIGHT retrieval (2026-09-09, the owner's direction: "поднять базу, по прямой
+#: линии взять, по прямой линии положить — максимально просто"). Every arm move is a
+#: joint line or a screw; the reach into the cabinet and the carry out of it are the
+#: BASE driving straight with the arm held (`drive_straight`), which needs no plan.
+#:
+#: Measured 2026-09-09 (probes in /workspace/diag/retrieval-sub/probes): from the
+#: WORK_DOCK_Y dock the hand hangs UNDER the cabinet (TCP y -0.43, z 1.06, the counter
+#: 14 cm below it), and every joint line out of that box — the torso raise included —
+#: sweeps the counter or the cabinet's bottom. From READY_DOCK_Y the same hand stands
+#: south of the counter's edge (-0.65), the torso line to READY_TORSO plans (17 knots),
+#: and a joint line to the pre-grasp posture plans on every seed probed (deep / mid /
+#: shallow cup); the drive of WORK_DOCK_Y - READY_DOCK_Y then carries the hand to the
+#: pre-grasp pose on a straight line. READY_TORSO is the torso's upper limit: the shelf
+#: (1.42) is then reached with the upper arm level and the forearm rising 68 deg —
+#: the grasp posture the IK returns at the limit — instead of the fully stretched
+#: diagonal that the TORSO_DRIVE grasps end on (their screws jam on the torso, unjam=3).
+STRAIGHT = os.environ.get("MIKASA_RETRIEVAL_STRAIGHT", "1") == "1"
+READY_DOCK_Y = float(os.environ.get("MIKASA_READY_DOCK_Y", "-1.35"))
+READY_TORSO = 0.386
+PLACE_TORSO = 0.0
+"The torso for the place: the joint line down from READY_TORSO IS the straight descent."
+READY_IK_INITS = 150
+READY_IK_GOALS = 60
+"""How many IK solutions of the ready pose the joint line is tried to, nearest first.
+Each is pre-checked (plans only, no steps): the straight drive into the cabinet must be
+collision-free with that posture, and the grasp screw must plan from where the drive
+ends — 1147's nearest solution drove its elbow into the door, 1167's first two put the
+wrist into the cabinet's bottom lip at the grasp (the probe, 2026-09-09)."""
+BACK_OFF_AFTER_RELEASE = float(os.environ.get("MIKASA_BACK_OFF_AFTER_RELEASE", "0.15"))
+RELEASE_LIFT = float(os.environ.get("MIKASA_RELEASE_LIFT", "0.12"))
+READY_GRASP_SLACK = 0.015
+RELEASE_RAMP = int(os.environ.get("MIKASA_RELEASE_RAMP", "12"))
+"""Steps the fingers take to open at the place (a linear ramp of the target). The
+8 g cup toppled at the release on 6/100 abs and 3/100 delta places with the one-step
+opening (2026-09-09, r2): upright at 1.3 deg after the descent, at 71 deg six steps
+after the open command, 11 cm north."""
+STRAIGHT_PLACE_DROP = float(os.environ.get("MIKASA_STRAIGHT_PLACE_DROP", "0.005"))
+"""The straight flow's PLACE_DROP: 5 mm, the cup all but standing when the pads part.
+A/B on the nine toppled seeds (2026-09-09): ramp 12 + drop 0.02 -> xy <= 9 mm on six
+abs seeds, one delta seed at 65 mm; ramp 0 + drop 0.005 -> two abs seeds still
+toppled (0.166, 0.200); ramp 12 + drop 0.005 -> every seed within 12 mm."""
+"""The pre-check's grasp stroke reaches this much DEEPER than the grasp: the posture is
+chosen with slack, because the drive lands a few millimetres off and the shallow
+cups' strokes end millimetres from the cabinet's bottom (1167: the pre-check planned,
+the stroke after the drive refused with 0.013 of the twist left)."""
+GRASP_LIFT = float(os.environ.get("MIKASA_GRASP_LIFT", "0.02"))
+"""The straight flow's TCP height above the cup's mid-height. The wrist_flex link's
+collision mesh reaches 0.067 m under the hand's axis (fetch_description; the flex
+motor's housing), and at the mid-height (1.477) that underside is at 1.410-1.423
+against the shelf top at 1.420: for a cup in the shallow half of the band the wrist
+is inside the cabinet's front plane at the grasp and the screw refuses on
+`wrist_flex_link<->cab` with millimetres of the twist left (1167, 1162,
+2026-09-09). 2 cm up puts the underside 2-3 cm over the shelf; the pads stay 2 cm
+under the rim (the cup is 11.5 cm tall)."""
+
 
 def plan_joints(env, planner, task, targets: dict, *, label: str, tries: int = 2,
-                line_only: bool = False):
+                line_only: bool = False, qpos_step: float | None = None):
     """Plan and execute a joint-space move, straight line first, RRT second.
 
     A trimmed copy of water_plants_planner.plan_to_joint_targets — that one
@@ -860,6 +932,8 @@ def plan_joints(env, planner, task, targets: dict, *, label: str, tries: int = 2
         # D6 contract would never get to speak).
         try:
             line = p.plan_qpos_line(goal, cur, time_step=task.control_timestep,
+                                    **({} if qpos_step is None
+                                       else {"qpos_step": float(qpos_step)}),
                                     ref_yaw=float(cur[2]))
         except RuntimeError as e:
             line = {"status": f"mplib raised: {e}", "position": []}
@@ -2225,6 +2299,487 @@ def close_the_door(env, planner, task, *, door: DoorSpec | None = None, anchor=N
     return res
 
 
+
+def ready_by_line(env, planner, task, ready, *, drive: float, grasp, label: str = "ready posture",
+                  slack=None, touch_needle: str | None = "cup", rank=None):
+    """A straight joint line from the current posture to an IK solution of `ready`, the
+    torso held where it is. Nearest solutions first; each is pre-checked, plans only:
+    the base's straight drive of `drive` metres along its heading with that posture,
+    and the screw to `grasp` from where the drive ends. The first line whose
+    pre-checks pass is executed with the standard follower. Returns the gym 5-tuple,
+    or -1 when none of READY_IK_GOALS solutions has such a line (nothing stepped).
+
+    Three parameters exist for the REVERSE direction (`cabinet_stow_planner`), and
+    their defaults are exactly this task's measured behaviour:
+
+    - `drive=0.0` skips the drive pre-check altogether — there is no drive to check,
+      and `plan_qpos_line` from a posture to itself is not a question worth asking.
+    - `slack` is the offset added to `grasp.p` before the screw pre-check; the
+      default `(0, READY_GRASP_SLACK, 0)` is "15 mm deeper into the cabinet", which
+      is meaningful for a grasp and not for a placement.
+    - `touch_needle` names what to drop from the planning world for that check. For a
+      grasp it is the cup, because the deeper target puts the palm inside it and what
+      is being checked is the arm against the cabinet. For a PLACEMENT the cup is
+      held and must stay in the world — pass None.
+
+    Example:
+        >>> res = ready_by_line(env, planner, task, ready, drive=0.30, grasp=grasp)  # doctest: +SKIP
+    """
+    import mplib
+    from utils.mikasa_oracle.motionplanning.fetch.utils import (goal_order, limit_joint_names,
+                                                          seam_first, unwrap_toward)
+
+    p = planner.planner
+    robot = task.agent.robot
+    cur = _np(robot.get_qpos()).reshape(-1).astype(np.float64)
+    cur_f = p.fold_qpos(cur)
+    held = [True, True, True, True] + [False] * (len(cur) - 4)   # base + torso held
+    try:
+        goal_b = p._transform_goal_to_wrt_base(mplib.Pose(p=ready.p, q=ready.q))
+        status, goals = p.IK(goal_b, cur_f, held, n_init_qpos=READY_IK_INITS)
+    except Exception as e:  # pragma: no cover - the solver's own failure modes
+        status, goals = f"IK raised {type(e).__name__}: {e}", None
+    if status != "Success" or goals is None or len(np.atleast_2d(goals)) == 0:
+        say(env, f"{label}: no IK solution", status=str(status)[:80])
+        return -1
+    goals = [unwrap_toward(np.asarray(g, dtype=float), cur_f, p.joint_limits)
+             for g in np.atleast_2d(goals)]
+    # `goal_order` ranks by the largest single joint's travel, nearest first. A caller
+    # can replace it: `MikasaDepthRecall-v1` ranks by ROLL travel, because the planning
+    # roll window (+-3.44) is narrower than a full turn, so a solution near the far edge
+    # can only be reached the long way round — 5.83 rad of wrist on one measured leg,
+    # which is the gripper "spinning like a wheel" in the clip. That was written on the
+    # +-6.28 URDF; since the merge onto the stock +-3.141 limits `PLAN_ROLL_WINDOW` is 0,
+    # and whether the roll rank still earns its place there is re-measured.
+    # `seam_first` then partitions whichever order came in (a no-op at the shipped
+    # `ROLL_SEAM_MARGIN` of 0).
+    order = goal_order(goals, cur_f) if rank is None else list(rank(goals, cur_f))
+    order = seam_first(order, p.joint_limits, names=limit_joint_names(p))
+    root = set(p._root_cols() or [])
+    heading = task.agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
+    dt = task.control_timestep
+    tried = []
+    for k, g in enumerate(order[:READY_IK_GOALS]):
+        full = cur.copy()
+        for j in range(min(len(full), len(g))):
+            if j not in root and j < 13:      # arm + torso from the solution; head, fingers as they are
+                full[j] = float(g[j])
+        try:
+            line = p.plan_qpos_line(full, cur, time_step=dt, ref_yaw=float(cur[2]))
+        except RuntimeError as e:
+            line = {"status": f"mplib raised: {e}"}
+        if line.get("status") != "Success" or len(np.asarray(line.get("position", []))) < 2:
+            tried.append(f"g{k}: {str(line.get('status'))[20:110]}")
+            continue
+        if float(drive) == 0.0:
+            driven = full
+        else:
+            driven = full.copy()
+            driven[0] += float(drive) * float(heading[0])
+            driven[1] += float(drive) * float(heading[1])
+            try:
+                sweep = p.plan_qpos_line(driven, full, time_step=dt, ref_yaw=float(cur[2]))
+            except RuntimeError as e:
+                sweep = {"status": f"mplib raised: {e}"}
+            if sweep.get("status") != "Success":
+                tried.append(f"g{k}: drive {str(sweep.get('status'))[20:70]}")
+                continue
+        off = (0.0, READY_GRASP_SLACK, 0.0) if slack is None else slack
+        deeper = mplib.Pose(p=np.asarray(grasp.p, dtype=np.float64)
+                            + np.asarray(off, dtype=np.float64),
+                            q=grasp.q)
+        try:
+            # For a GRASP: the cup out of the world, because the deeper target would
+            # put the palm inside it and what is checked is the arm against the
+            # CABINET. For a PLACEMENT the held cup stays in (touch_needle=None).
+            with (common.touchable(planner, touch_needle) if touch_needle
+                  else contextlib.nullcontext()):
+                screw = p.plan_screw(deeper, driven, time_step=dt,
+                                     masked_joints=~np.array(held),
+                                     goal_tolerance=planner.ARM_SCREW_GOAL_TOLERANCE)
+        except Exception as e:  # pragma: no cover
+            screw = {"status": f"screw raised {type(e).__name__}"}
+        if screw.get("status") != "Success":
+            tried.append(f"g{k}: grasp {str(screw.get('status'))[18:70]}")
+            continue
+        say(env, f"{label}: joint line", knots=int(np.asarray(line["position"]).shape[0]),
+            ik_goal=k, ik_goals=len(order), grasp_knots=int(np.asarray(screw["position"]).shape[0]),
+            arm=[round(float(v), 2) for v in full[5:13]])
+        return planner.follow_forward_path_w_refinement(line, refine=True)
+    say(env, f"{label}: no line", tried=tried[:8], ik_goals=len(order))
+    return -1
+
+
+def _straight_move(env, planner, pose, *, stage: str, tries: int = 1):
+    """`arm_move` restricted to the straight channels: the screw (torso held), never an
+    RRT path (`max_knots=1, knot_refuse=True`). -1 or the 5-tuple."""
+    return common.arm_move(env, planner, pose, who=WHO, stage=stage, tries=tries,
+                           disable_lift_joint=True, max_knots=1, knot_refuse=True)
+
+
+def take_and_place_straight(env, planner, task, cup_p):
+    """Stages 2-4 by straight strokes; the base parked at READY_DOCK_Y facing +y.
+
+    raise the torso (joint line) -> the pre-grasp posture (joint line, `ready_by_line`)
+    -> the base drives straight into the cabinet (the hand arrives at the pre-grasp)
+    -> grasp (screw) -> close -> unshelve +3 cm (screw) -> the base drives straight
+    back until the cup stands over the place target -> the torso comes down (joint
+    line) -> the last centimetres down (screw) -> release -> the base backs off.
+
+    Fallbacks, each only after its straight stroke refused: the grasp ladder over
+    SIDE_GRASP_DEPTHS, then the plain `arm_move` (RRT allowed) for the grasp and the
+    descent — what the legacy stages did on every seed.
+
+    Returns `(res, done)` as `take_and_place_legacy`.
+
+    Example:
+        >>> res, done = take_and_place_straight(env, planner, task, cup_p)   # doctest: +SKIP
+        >>> if done: return res                                              # doctest: +SKIP
+    """
+    res = -1
+    # -- STAGE 2a: the torso up, the arm to the pre-grasp posture -------------------
+    say(env, "raise the torso", torso=READY_TORSO)
+    res = plan_joints(env, planner, task, {"torso_lift_joint": READY_TORSO},
+                      label="raise the torso", line_only=True)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "raise the torso at the dock"), True
+    planner.planner.update_from_simulation()
+
+    base_p = _np(task.agent.base_link.pose.p).reshape(-1, 3)[0]
+    drive = float(WORK_DOCK_Y - base_p[1])
+    grasp, pre = side_grasp_pose(task, SIDE_GRASP_DEPTHS[0], lift=GRASP_LIFT)
+    if grasp is None:
+        return fail(env, "grasp: the cup has no collision mesh"), True
+    ready = sapien.Pose(p=[float(pre.p[0]), float(pre.p[1]) - drive, float(pre.p[2])], q=pre.q)
+    say(env, "ready posture", ready=[round(float(v), 3) for v in ready.p], drive=round(drive, 3))
+    res = ready_by_line(env, planner, task, ready, drive=drive, grasp=grasp)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "ready posture at the dock"), True
+    planner.planner.update_from_simulation()
+    tcp = task.agent.tcp.pose.sp
+    say(env, "ready", tcp=[round(float(v), 3) for v in tcp.p],
+        err=round(float(np.linalg.norm(np.asarray(tcp.p) - np.asarray(ready.p))), 3))
+
+    # -- STAGE 2b: the base drives the hand into the cabinet, straight ------------
+    say(env, "drive into the cabinet", distance=round(drive, 3))
+    res = planner.drive_straight(drive, v=0.10)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "drive into the cabinet"), True
+    planner.planner.update_from_simulation()
+    tcp = task.agent.tcp.pose.sp
+    say(env, "at the shelf", tcp=[round(float(v), 3) for v in tcp.p],
+        pre=[round(float(v), 3) for v in pre.p])
+
+    # -- STAGE 2c: grasp by a straight stroke; the depth ladder; RRT last -----------
+    grasped = False
+    plans = [(d, True) for d in SIDE_GRASP_DEPTHS] + [(SIDE_GRASP_DEPTHS[0], False)]
+    for depth, straight in plans:
+        grasp, _pre = side_grasp_pose(task, depth, lift=GRASP_LIFT)
+        say(env, "grasp stroke", depth=depth, straight=straight,
+            grasp=[round(float(v), 3) for v in grasp.p])
+        if straight:
+            res = _straight_move(env, planner, grasp, stage=f"grasp (depth {depth})")
+        else:
+            res = common.arm_move(env, planner, grasp, who=WHO,
+                                  stage=f"grasp (depth {depth}, any plan)", tries=3)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if res == -1:
+            say(env, "grasp stroke refused", depth=depth, straight=straight)
+            planner.planner.update_from_simulation()
+            continue
+        res = planner.close_gripper(t=12)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if bool(_np(task.agent.is_grasping(task.cup)).any()):
+            say(env, "cup in the gripper", depth=depth, straight=straight)
+            grasped = True
+            break
+        say(env, "close missed", depth=depth)
+        planner.open_gripper()
+        planner.planner.update_from_simulation()
+    if not grasped:
+        return fail(env, "grasp the cup off the shelf",
+                    tried=[float(d) for d in SIDE_GRASP_DEPTHS]), True
+    planner.planner.update_from_simulation()
+    common.hold_object_in_planner(env, planner, task, task.cup, held=True, who=WHO)
+
+    # -- STAGE 3a: unshelve, straight up -------------------------------------------
+    tcp = task.agent.tcp.pose.sp
+    up = sapien.Pose(p=np.asarray(tcp.p) + [0, 0, UNSHELVE_DZ], q=tcp.q)
+    res = _straight_move(env, planner, up, stage="unshelve")
+    if res == -1:
+        res = common.arm_move(env, planner, up, who=WHO, stage="unshelve (any plan)", tries=2)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "unshelve the cup"), True
+    if not _b(res[-1], "is_grasped"):
+        say(env, "MISSED: the cup left the gripper at the unshelve")
+        return res, True
+    planner.planner.update_from_simulation()
+
+    # -- STAGE 3b: the base carries the cup straight out, to the place column ------
+    target = _np(task.place_target).reshape(-1, 3)[0]
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    back = float(cup_now[1] - target[1])
+    say(env, "carry out: the base backs off straight", distance=round(back, 3))
+    res = planner.drive_straight(-back, v=0.10)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "carry out of the cabinet"), True
+    planner.planner.update_from_simulation()
+    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
+        say(env, "MISSED: the cup left the gripper on the way out")
+        return res, True
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    say(env, "over the place target", cup=[round(float(v), 3) for v in cup_now],
+        tilt_deg=round(common._tilt_deg(_np(task.cup.pose.q).reshape(-1)), 1),
+        target=[round(float(v), 3) for v in target])
+
+    # -- STAGE 3c: the torso comes down (the straight descent), then the last cm ----
+    for torso in (PLACE_TORSO, 0.10, 0.20):
+        res = plan_joints(env, planner, task, {"torso_lift_joint": torso},
+                          label=f"lower the torso to {torso}", line_only=True)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if res != -1:
+            break
+    planner.planner.update_from_simulation()
+    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
+        say(env, "MISSED: the cup left the gripper on the way down")
+        return res if res != -1 else planner.idle_steps(t=1), True
+
+    mesh = task.cup.get_first_collision_mesh(to_world_frame=True)
+    bottom = float(np.asarray(mesh.bounds)[0][2])
+    tcp = task.agent.tcp.pose.sp
+    drop = bottom - (float(target[2]) + STRAIGHT_PLACE_DROP)
+    place = sapien.Pose(p=[float(target[0]), float(target[1]), float(tcp.p[2]) - drop], q=tcp.q)
+    say(env, "descend to the counter", drop=round(drop, 3),
+        place=[round(float(v), 3) for v in place.p])
+    res = _straight_move(env, planner, place, stage="descend to the counter")
+    if res == -1:
+        res = common.arm_move(env, planner, place, who=WHO,
+                              stage="descend to the counter (any plan)", tries=3)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "descend to the counter"), True
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    say(env, "descended", cup=[round(float(v), 3) for v in cup_now],
+        tilt_deg=round(common._tilt_deg(_np(task.cup.pose.q).reshape(-1)), 1),
+        tcp=[round(float(v), 3) for v in task.agent.tcp.pose.sp.p])
+
+    # -- STAGE 4: release, back off ----------------------------------------------
+    res = planner.open_gripper(t=RELEASE_RAMP + 6, ramp=RELEASE_RAMP)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    common.hold_object_in_planner(env, planner, task, task.cup, held=False, who=WHO)
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    say(env, "released", cup=[round(float(v), 3) for v in cup_now],
+        tilt_deg=round(common._tilt_deg(_np(task.cup.pose.q).reshape(-1)), 1),
+        fingers=[round(float(v), 4) for v in _np(task.agent.robot.get_qpos()).reshape(-1)[13:15]])
+    if RELEASE_LIFT > 0.0:
+        # the hand straight up out of the cup before the base moves: with the fingers
+        # still around the cup the 15 cm reverse knocked it over on 4/100 delta seeds
+        # (r3, 2026-09-09) — the verdict had latched, the cup lay 10-49 cm away
+        torso_now = float(_np(task.agent.robot.get_qpos()).reshape(-1)[3])
+        planner.planner.update_from_simulation()
+        with common.touchable(planner, "cup"):    # the open fingers stand around it
+            up = plan_joints(env, planner, task,
+                             {"torso_lift_joint": min(READY_TORSO, torso_now + RELEASE_LIFT)},
+                             label="lift the hand off the cup", line_only=True)
+        if up != -1:
+            res = up
+            if common.stopped_by_horizon(planner):
+                return res, True
+    if BACK_OFF_AFTER_RELEASE > 0.0:
+        back = planner.drive_straight(-BACK_OFF_AFTER_RELEASE, v=0.10)
+        if back != -1:
+            res = back
+            if common.stopped_by_horizon(planner):
+                return res, True
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    say(env, "backed off", cup=[round(float(v), 3) for v in cup_now],
+        tilt_deg=round(common._tilt_deg(_np(task.cup.pose.q).reshape(-1)), 1))
+    return res, False
+
+
+def take_and_place_legacy(env, planner, task, cup_p):
+    """The pre-2026-09-09 stages 2-4 (RRT reaches, the planned back-off, the hover), kept
+    verbatim behind `MIKASA_RETRIEVAL_STRAIGHT=0` for A/B measurement. Returns
+    `(res, done)`: `done` means the episode is over (a refusal or a miss) and `res` is
+    what `solve` returns; otherwise the caller goes on to the door stage and the settle.
+
+    Example:
+        >>> res, done = take_and_place_legacy(env, planner, task, cup_p)     # doctest: +SKIP
+        >>> if done: return res                                              # doctest: +SKIP
+    """
+    res = -1
+    # -- STAGE 2: side-grasp the cup off the shelf ---------------------------------
+    grasped = False
+    for depth in SIDE_GRASP_DEPTHS:
+        grasp, pre = side_grasp_pose(task, depth)
+        if grasp is None:
+            return fail(env, "grasp: the cup has no collision mesh"), True
+        say(env, "reach the shelf", depth=depth,
+            grasp=[round(float(v), 3) for v in grasp.p])
+        res = common.arm_move(env, planner, pre, who=WHO,
+                              stage=f"pre-grasp (depth {depth})", tries=3)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if res == -1:
+            say(env, "pre-grasp refused", depth=depth)
+            continue
+        res = common.arm_move(env, planner, grasp, who=WHO,
+                              stage=f"grasp (depth {depth})", tries=3)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if res == -1:
+            say(env, "grasp pose refused", depth=depth)
+            planner.planner.update_from_simulation()
+            continue
+        res = planner.close_gripper(t=12)
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res, True
+        if bool(_np(task.agent.is_grasping(task.cup)).any()):
+            say(env, "cup in the gripper", depth=depth)
+            grasped = True
+            break
+        say(env, "close missed", depth=depth)
+        planner.open_gripper()
+        planner.planner.update_from_simulation()
+    if not grasped:
+        return fail(env, "grasp the cup off the shelf",
+                    tried=[float(d) for d in SIDE_GRASP_DEPTHS]), True
+    planner.planner.update_from_simulation()
+    common.hold_object_in_planner(env, planner, task, task.cup, held=True, who=WHO)
+
+    # -- STAGE 3: unshelve, retract through the opening, lower to the counter ------
+    # The W13 exit profile verbatim. Each leg re-reads the TCP: the previous leg's
+    # refinement decides where this one starts.
+    tcp = task.agent.tcp.pose.sp
+    res = common.arm_move(
+        env, planner, sapien.Pose(p=np.asarray(tcp.p) + [0, 0, UNSHELVE_DZ], q=tcp.q),
+        who=WHO, stage="unshelve", tries=3)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "unshelve the cup"), True
+    if not _b(res[-1], "is_grasped"):
+        say(env, "MISSED: the cup left the gripper at the unshelve")
+        return res, True
+    planner.planner.update_from_simulation()
+
+    tcp = task.agent.tcp.pose.sp
+    # base_link, not robot.pose: ds_fetch's root pose is the identity — the base
+    # lives in qpos[0:2] — and reading robot.pose sent the first retract to
+    # y=+0.55, through the kitchen wall, with the attached cup reported colliding
+    # against it. base_link is where the oracles read the base everywhere.
+    base_y = float(_np(task.agent.base_link.pose.p).reshape(-1, 3)[0][1])
+    res = common.arm_move(
+        env, planner,
+        sapien.Pose(p=[float(tcp.p[0]), base_y + RETRACT_REACH, float(tcp.p[2])],
+                    q=tcp.q),
+        who=WHO, stage="retract out of the cabinet", tries=3)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "retract out of the cabinet"), True
+    planner.planner.update_from_simulation()
+
+    # Back the base off before the hover: the place target sits 0.52 m from the
+    # grasp dock, and a horizontal grip at that reach re-runs the close-and-high
+    # refusal (`joint limit at index [3]` measured on the first run). Backing to
+    # ~0.78 m of reach reproduces W13's hover geometry exactly, and a base move
+    # under a live grasp is the solver's normal execution path (W12: the gripper
+    # state is re-emitted every step of `follow_moving_forward`).
+    say(env, "back the base off", delta=-0.25)
+    with common.capture_refusal("screw plan failed:") as cap:
+        res = planner.move_forward_delta(-0.25)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        # The planned back-off is a screw over base and arm together. Refused for a
+        # JOINT LIMIT (the grasp left a wrist joint on its limit — 1101/1102 under
+        # pd_joint_delta_pos, 2026-09-09), backing up needs no plan: the base drives
+        # straight back with the arm held and the cup rides along (`drive_straight`).
+        # Refused for a COLLISION (`cab ... <-> cup`: the cup would drag through the
+        # cabinet's front on the way out — 1140/1144 under the clock follower), the
+        # planner is right and the straight drive knocked the cup out of the hand;
+        # then the hover from here is the only way, as before the fallback.
+        why = cap.refusal or ""
+        if "collision" in why:
+            say(env, "back-off refused by a collision; trying the hover from here", refusal=why[:90])
+        else:
+            say(env, "back-off refused; driving straight back instead", delta=-0.25, refusal=why[:60])
+            res = planner.drive_straight(-0.25, v=0.10)
+            if res != -1 and common.stopped_by_horizon(planner):
+                return res, True
+            if res == -1:
+                say(env, "the straight back-off refused too; trying the hover from here")
+    planner.planner.update_from_simulation()
+    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
+        say(env, "MISSED: the cup left the gripper during the back-off")
+        return res if res != -1 else planner.idle_steps(t=1), True
+
+    target = _np(task.place_target).reshape(-1, 3)[0]
+    tcp = task.agent.tcp.pose.sp
+    res = common.arm_move(
+        env, planner,
+        sapien.Pose(p=[float(target[0]), float(target[1]), HOVER_Z], q=tcp.q),
+        who=WHO, stage="hover over the place target", tries=3)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "hover over the place target"), True
+    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
+        say(env, "MISSED: the cup left the gripper on the way down")
+        return res, True
+    planner.planner.update_from_simulation()
+
+    # Descend until the cup's mesh bottom is PLACE_DROP above the counter. The
+    # cup-to-TCP offset is read here, from the still moment, not assumed.
+    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
+    mesh = task.cup.get_first_collision_mesh(to_world_frame=True)
+    bottom = float(np.asarray(mesh.bounds)[0][2])
+    tcp = task.agent.tcp.pose.sp
+    drop = bottom - (float(target[2]) + PLACE_DROP)
+    res = common.arm_move(
+        env, planner,
+        sapien.Pose(p=[float(tcp.p[0]), float(tcp.p[1]), float(tcp.p[2]) - drop],
+                    q=tcp.q),
+        who=WHO, stage="descend to the counter", tries=3)
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    if res == -1:
+        return fail(env, "descend to the counter"), True
+
+    # -- STAGE 4: release, back off, settle ----------------------------------------
+    res = planner.open_gripper()
+    if res != -1 and common.stopped_by_horizon(planner):
+        return res, True
+    common.hold_object_in_planner(env, planner, task, task.cup, held=False, who=WHO)
+    tcp = task.agent.tcp.pose.sp
+    back = common.arm_move(
+        env, planner,
+        sapien.Pose(p=[float(tcp.p[0]), float(tcp.p[1]) - 0.15, float(tcp.p[2]) + 0.10],
+                    q=tcp.q),
+        who=WHO, stage="back off", tries=2)
+    if back != -1:
+        res = back
+        if common.stopped_by_horizon(planner):
+            return res, True
+
+    return res, False
+
 def solve(env, seed=None, debug=False, vis=False, blind=False,
           planner_factory=common.default_planner_factory):
     """Solve one episode. `-1` on a planning/grasp refusal, the gym 5-tuple otherwise.
@@ -2324,7 +2879,8 @@ def solve(env, seed=None, debug=False, vis=False, blind=False,
             return res
         planner.planner.update_from_simulation()
 
-    dock = np.array([cup_p[0], WORK_DOCK_Y, 0.0])
+    dock_y = READY_DOCK_Y if STRAIGHT else WORK_DOCK_Y
+    dock = np.array([cup_p[0], dock_y, 0.0])
     say(env, "dock at the cabinet", dock=[round(float(v), 3) for v in dock])
     res = planner.drive_base(target_pos=dock, target_view_vec=np.array([0.0, 1.0, 0.0]))
     if res != -1 and common.stopped_by_horizon(planner):
@@ -2335,155 +2891,12 @@ def solve(env, seed=None, debug=False, vis=False, blind=False,
     d_dock, dyaw = common.dock_error(task, (dock[0], dock[1], math.pi / 2))
     say(env, "parked", d_dock=round(d_dock, 3), dyaw_deg=round(dyaw, 1))
 
-    # No torso raise here, and the absence is measured — see TORSO_DRIVE.
-
-    # -- STAGE 2: side-grasp the cup off the shelf ---------------------------------
-    grasped = False
-    for depth in SIDE_GRASP_DEPTHS:
-        grasp, pre = side_grasp_pose(task, depth)
-        if grasp is None:
-            return fail(env, "grasp: the cup has no collision mesh")
-        say(env, "reach the shelf", depth=depth,
-            grasp=[round(float(v), 3) for v in grasp.p])
-        res = common.arm_move(env, planner, pre, who=WHO,
-                              stage=f"pre-grasp (depth {depth})", tries=3)
-        if res != -1 and common.stopped_by_horizon(planner):
-            return res
-        if res == -1:
-            say(env, "pre-grasp refused", depth=depth)
-            continue
-        res = common.arm_move(env, planner, grasp, who=WHO,
-                              stage=f"grasp (depth {depth})", tries=3)
-        if res != -1 and common.stopped_by_horizon(planner):
-            return res
-        if res == -1:
-            say(env, "grasp pose refused", depth=depth)
-            planner.planner.update_from_simulation()
-            continue
-        res = planner.close_gripper(t=12)
-        if res != -1 and common.stopped_by_horizon(planner):
-            return res
-        if bool(_np(task.agent.is_grasping(task.cup)).any()):
-            say(env, "cup in the gripper", depth=depth)
-            grasped = True
-            break
-        say(env, "close missed", depth=depth)
-        planner.open_gripper()
-        planner.planner.update_from_simulation()
-    if not grasped:
-        return fail(env, "grasp the cup off the shelf",
-                    tried=[float(d) for d in SIDE_GRASP_DEPTHS])
-    planner.planner.update_from_simulation()
-    common.hold_object_in_planner(env, planner, task, task.cup, held=True, who=WHO)
-
-    # -- STAGE 3: unshelve, retract through the opening, lower to the counter ------
-    # The W13 exit profile verbatim. Each leg re-reads the TCP: the previous leg's
-    # refinement decides where this one starts.
-    tcp = task.agent.tcp.pose.sp
-    res = common.arm_move(
-        env, planner, sapien.Pose(p=np.asarray(tcp.p) + [0, 0, UNSHELVE_DZ], q=tcp.q),
-        who=WHO, stage="unshelve", tries=3)
-    if res != -1 and common.stopped_by_horizon(planner):
+    if STRAIGHT:
+        res, done = take_and_place_straight(env, planner, task, cup_p)
+    else:
+        res, done = take_and_place_legacy(env, planner, task, cup_p)
+    if done:
         return res
-    if res == -1:
-        return fail(env, "unshelve the cup")
-    if not _b(res[-1], "is_grasped"):
-        say(env, "MISSED: the cup left the gripper at the unshelve")
-        return res
-    planner.planner.update_from_simulation()
-
-    tcp = task.agent.tcp.pose.sp
-    # base_link, not robot.pose: ds_fetch's root pose is the identity — the base
-    # lives in qpos[0:2] — and reading robot.pose sent the first retract to
-    # y=+0.55, through the kitchen wall, with the attached cup reported colliding
-    # against it. base_link is where the oracles read the base everywhere.
-    base_y = float(_np(task.agent.base_link.pose.p).reshape(-1, 3)[0][1])
-    res = common.arm_move(
-        env, planner,
-        sapien.Pose(p=[float(tcp.p[0]), base_y + RETRACT_REACH, float(tcp.p[2])],
-                    q=tcp.q),
-        who=WHO, stage="retract out of the cabinet", tries=3)
-    if res != -1 and common.stopped_by_horizon(planner):
-        return res
-    if res == -1:
-        return fail(env, "retract out of the cabinet")
-    planner.planner.update_from_simulation()
-
-    # Back the base off before the hover: the place target sits 0.52 m from the
-    # grasp dock, and a horizontal grip at that reach re-runs the close-and-high
-    # refusal (`joint limit at index [3]` measured on the first run). Backing to
-    # ~0.78 m of reach reproduces W13's hover geometry exactly, and a base move
-    # under a live grasp is the solver's normal execution path (W12: the gripper
-    # state is re-emitted every step of `follow_moving_forward`).
-    say(env, "back the base off", delta=-0.25)
-    res = planner.move_forward_delta(-0.25)
-    if res != -1 and common.stopped_by_horizon(planner):
-        return res
-    if res == -1:
-        # The planned back-off is a screw over base and arm together, and it is
-        # refused when the grasp left a wrist joint on its limit (`joint limit at
-        # index [11]`, 1101/1102 under pd_joint_delta_pos, 2026-09-09) — then the hover
-        # from the close dock runs into the close-and-high refusal this back-off
-        # exists to avoid. Backing up needs no plan: the base drives straight back
-        # with the arm held, the cup rides along in the gripper (`drive_straight`).
-        say(env, "back-off refused; driving straight back instead", delta=-0.25)
-        res = planner.drive_straight(-0.25, v=0.10)
-        if res != -1 and common.stopped_by_horizon(planner):
-            return res
-        if res == -1:
-            say(env, "the straight back-off refused too; trying the hover from here")
-    planner.planner.update_from_simulation()
-    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
-        say(env, "MISSED: the cup left the gripper during the back-off")
-        return res if res != -1 else planner.idle_steps(t=1)
-
-    target = _np(task.place_target).reshape(-1, 3)[0]
-    tcp = task.agent.tcp.pose.sp
-    res = common.arm_move(
-        env, planner,
-        sapien.Pose(p=[float(target[0]), float(target[1]), HOVER_Z], q=tcp.q),
-        who=WHO, stage="hover over the place target", tries=3)
-    if res != -1 and common.stopped_by_horizon(planner):
-        return res
-    if res == -1:
-        return fail(env, "hover over the place target")
-    if not bool(_np(task.agent.is_grasping(task.cup)).any()):
-        say(env, "MISSED: the cup left the gripper on the way down")
-        return res
-    planner.planner.update_from_simulation()
-
-    # Descend until the cup's mesh bottom is PLACE_DROP above the counter. The
-    # cup-to-TCP offset is read here, from the still moment, not assumed.
-    cup_now = _np(task.cup.pose.p).reshape(-1, 3)[0]
-    mesh = task.cup.get_first_collision_mesh(to_world_frame=True)
-    bottom = float(np.asarray(mesh.bounds)[0][2])
-    tcp = task.agent.tcp.pose.sp
-    drop = bottom - (float(target[2]) + PLACE_DROP)
-    res = common.arm_move(
-        env, planner,
-        sapien.Pose(p=[float(tcp.p[0]), float(tcp.p[1]), float(tcp.p[2]) - drop],
-                    q=tcp.q),
-        who=WHO, stage="descend to the counter", tries=3)
-    if res != -1 and common.stopped_by_horizon(planner):
-        return res
-    if res == -1:
-        return fail(env, "descend to the counter")
-
-    # -- STAGE 4: release, back off, settle ----------------------------------------
-    res = planner.open_gripper()
-    if res != -1 and common.stopped_by_horizon(planner):
-        return res
-    common.hold_object_in_planner(env, planner, task, task.cup, held=False, who=WHO)
-    tcp = task.agent.tcp.pose.sp
-    back = common.arm_move(
-        env, planner,
-        sapien.Pose(p=[float(tcp.p[0]), float(tcp.p[1]) - 0.15, float(tcp.p[2]) + 0.10],
-                    q=tcp.q),
-        who=WHO, stage="back off", tries=2)
-    if back != -1:
-        res = back
-        if common.stopped_by_horizon(planner):
-            return res
 
     # -- STAGE 5 (require_door_closed only): close the door behind you -------------
     # Gated on the config like stage 1b, so tasks without the requirement run a

@@ -301,7 +301,7 @@
     <child link="upperarm_roll_link"/>
     <axis xyz="1 0 0"/>
     <dynamics damping="1.0" />
-    <limit effort="76.94" lower="-6.28" upper="6.28" velocity="1.571"/>
+    <limit effort="76.94" lower="-3.141" upper="3.141" velocity="1.571"/>
   </joint>
   <link name="elbow_flex_link">
     <inertial>
@@ -355,7 +355,7 @@
     <child link="forearm_roll_link"/>
     <axis xyz="1 0 0"/>
     <dynamics damping="5.0" />
-    <limit effort="29.35" lower="-6.28" upper="6.28" velocity="1.571"/>
+    <limit effort="29.35" lower="-3.141" upper="3.141" velocity="1.571"/>
   </joint>
   <link name="wrist_flex_link">
     <inertial>
@@ -409,13 +409,21 @@
     <child link="wrist_roll_link"/>
     <axis xyz="1 0 0"/>
     <dynamics damping="5.0" />
-    <limit effort="7.36" lower="-6.28" upper="6.28" velocity="2.268"/>
+    <limit effort="7.36" lower="-3.141" upper="3.141" velocity="2.268"/>
   </joint>
   <link name="gripper_link">
+    <!-- This link's frame is turned by `gripper_axis`'s rpy (pi, -pi/2, 0) = R, and the
+         meshes were re-baked by exactly that R: measured 2026-09-12, our gripper_link.STL
+         is the stock one turned by R, vertex for vertex (755 vertices, max difference
+         0.00e+00). The inertial was NOT turned with them — it kept the stock numbers, which
+         in the turned frame name another point: the hand's mass sat 0.165 m from the wrist
+         along the approach axis and 0.090 m off it, against the stock 0.076 m and 0.002 m.
+         Turned here by the same R: the origin by R, the tensor by R I R, which for this R
+         swaps ixx and izz. Now the mass sits where the geometry is. -->
     <inertial>
-      <origin rpy="0 0 0" xyz="-0.0900 -0.0001 -0.0017"/>
+      <origin rpy="0 0 0" xyz="-0.0017 0.0001 -0.0900"/>
       <mass value="1.5175"/>
-      <inertia ixx="0.0013" ixy="-0.0" ixz="0.0" iyy="0.0019" iyz="-0.0" izz="0.0024"/>
+      <inertia ixx="0.0024" ixy="0.0" ixz="0.0" iyy="0.0019" iyz="0.0" izz="0.0013"/>
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
@@ -438,9 +446,13 @@
   </joint>
   <link name="r_gripper_finger_link">
     <inertial>
-      <origin rpy="0 0 0" xyz="-0.01 0 0"/>
+      <!-- Turned by R with the hand (see gripper_link): this link hangs off the turned
+           gripper frame, so the stock (-0.01, 0, 0) is (0, 0, -0.01) here, and R I R swaps
+           ixx and izz. The finger meshes were re-baked to match, with r and l swapping
+           places in the world; the pair stands where the stock pair stands. -->
+      <origin rpy="0 0 0" xyz="0 0 -0.01"/>
       <mass value="0.0798"/>
-      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.002"/>
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0.101425 0"/>
@@ -468,9 +480,13 @@
   </joint>
   <link name="l_gripper_finger_link">
     <inertial>
-      <origin rpy="0 0 0" xyz="-0.01 0 0"/>
+      <!-- Turned by R with the hand (see gripper_link): this link hangs off the turned
+           gripper frame, so the stock (-0.01, 0, 0) is (0, 0, -0.01) here, and R I R swaps
+           ixx and izz. The finger meshes were re-baked to match, with r and l swapping
+           places in the world; the pair stands where the stock pair stands. -->
+      <origin rpy="0 0 0" xyz="0 0 -0.01"/>
       <mass value="0.0798"/>
-      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.002"/>
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 -0.101425 0"/>
