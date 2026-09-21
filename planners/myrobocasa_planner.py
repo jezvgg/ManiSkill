@@ -11,8 +11,8 @@ from trimesh.primitives import Box
 
 from mani_skill.agents.robots import Fetch
 from mani_skill.envs.tasks import MyRoboCasaScene
-from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
-from mani_skill.examples.motionplanning.fetch.utils import (
+from robots.fetch.extand import FetchMotionPlanningSapienSolver
+from robots.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
 from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
@@ -41,9 +41,9 @@ def planning(env, seed, debug=False, vis=None, info=False) -> bool:
     if vis is None:
         vis = (env.unwrapped.render_mode == "human")
     unwenv: MyRoboCasaScene = env.unwrapped
-    agent: Fetch = unwenv.agent
     FINGER_LENGTH = 0.025
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
+    agent: Fetch = unwenv.agent  # reconfigure replaces the agent instance
     planner = FetchMotionPlanningSapienSolver(
         env,
         base_pose=agent.robot.pose,
@@ -209,7 +209,7 @@ if __name__ == "__main__":
         "MyRoboCasa-v1",
         num_envs=1,
         render_mode=args.render_mode,
-        robot_uids="ds_fetch_canonical",
+        robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
     )
     # Video-only recording: frames stream straight into ffmpeg, so RAM stays at

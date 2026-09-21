@@ -24,7 +24,6 @@ import pyarrow.parquet as pq
 import tyro
 
 from mani_skill.trajectory.convert_to_lerobot import (
-    create_directory_structure,
     create_video_from_frames,
     parse_image_size,
     process_episode,

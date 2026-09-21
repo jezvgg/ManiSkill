@@ -13,16 +13,13 @@ Usage:
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 
 import h5py
 import numpy as np
-import torch
 
 import gymnasium as gym
 
-import planners.myrobocasa_takeitback_tray_planner  # noqa: F401 registers envs
 from mani_skill.trajectory import utils as trajectory_utils
 from mani_skill.utils import common
 
@@ -43,8 +40,6 @@ def main():
     episode = src_json["episodes"][args.episode]
     seed = episode.get("episode_seed")
     control_mode = episode.get("control_mode", env_info["env_kwargs"]["control_mode"])
-    src_robot = env_info["env_kwargs"]["robot_uids"]
-
     env = gym.make(
         env_info["env_id"],
         num_envs=1,
@@ -87,7 +82,7 @@ def main():
         agent = g.create_group("obs/agent")
         qpos_ds = agent.create_dataset("qpos", shape=(0, 15), maxshape=(None, 15), dtype=np.float32)
         qvel_ds = agent.create_dataset("qvel", shape=(0, 15), maxshape=(None, 15), dtype=np.float32)
-        actions_ds = g.create_dataset("actions", data=actions[::args.stride], dtype=np.float32)
+        g.create_dataset("actions", data=actions[::args.stride], dtype=np.float32)
         for name, arr in (
             ("rewards", rewards), ("success", success),
             ("terminated", terminated), ("truncated", truncated),
@@ -101,7 +96,6 @@ def main():
         cam_groups = {}
         for cam in sensor_names:
             grp = g.create_group(f"obs/sensor_data/{cam}")
-            n_rec = (T + 1 + args.stride - 1) // args.stride
             cam_groups[cam] = grp.create_dataset(
                 "rgb",
                 shape=(0, *obs["sensor_data"][cam]["rgb"].shape[-3:]),

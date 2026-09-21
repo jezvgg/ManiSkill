@@ -6,7 +6,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +13,20 @@ import gymnasium as gym
 import numpy as np
 
 from mani_skill.utils import common
+
+
+def _looks_like_an_actor(value):
+    """Return whether a task attribute exposes one batched pose."""
+    try:
+        if not isinstance(getattr(value, "name", None), str):
+            return False
+        if hasattr(value, "get_links"):
+            return False
+        pose = getattr(value, "pose", None)
+        return hasattr(pose, "p") and hasattr(pose, "q")
+    except Exception:
+        return False
+
 
 """
 Planner logging utilities for multi-step robot manipulation environments.
@@ -115,6 +128,7 @@ class PlannerLogger(gym.Wrapper):
         except OSError as e:
             raise OSError(f"cannot create event log in {self.dir}: {e}") from e
         self._objs = {}  # name -> open csv file handle
+        self._finished = False
 
     # --- public API -----------------------------------------------------
     def track_object(self, handle, name):
@@ -123,7 +137,7 @@ class PlannerLogger(gym.Wrapper):
         Its pose is written to ``<name>_trajectory.csv`` every ``log_freq`` steps.
         """
         if name in self._objs:
-            return
+            return self.dir / f"{name}_trajectory.csv"
         path = self.dir / f"{name}_trajectory.csv"
         try:
             f = open(path, "w", encoding="utf-8")
@@ -133,6 +147,28 @@ class PlannerLogger(gym.Wrapper):
         self._objs[name] = (handle, f)
         self._write_row(name)  # starting pose
         return path
+
+    def track_task_actors(self, task, names=None):
+        """Register direct task actors plus robot TCP/base trajectories."""
+        if names is None:
+            candidates = [
+                (attr, value)
+                for attr, value in vars(task).items()
+                if not attr.startswith("_") and _looks_like_an_actor(value)
+            ]
+        else:
+            candidates = [(name, getattr(task, name)) for name in names]
+
+        agent = getattr(task, "agent", None)
+        for attr, label in (("tcp", "robot_tcp"), ("base_link", "robot_base")):
+            handle = getattr(agent, attr, None) if agent is not None else None
+            if handle is not None:
+                candidates.append((label, handle))
+
+        return {
+            label: self.track_object(handle, label)
+            for label, handle in candidates
+        }
 
     def log_event(self, event, message="", **extra):
         rec = {
@@ -186,13 +222,24 @@ class PlannerLogger(gym.Wrapper):
 
     def reset(self, *args, **kwargs):
         self._step = 0
-        return self.env.reset(*args, **kwargs)
+        result = self.env.reset(*args, **kwargs)
+        seed = kwargs.get("seed", args[0] if args else None)
+        self.log_event("reset", **({} if seed is None else {"seed": seed}))
+        return result
 
-    def close(self):
-        try:
+    def finish(self):
+        """Close log files without closing the wrapped environment."""
+        if not self._finished:
+            self._finished = True
+            self._events_f.flush()
             for _, f in self._objs.values():
                 f.close()
             self._events_f.close()
+        return self.dir
+
+    def close(self):
+        try:
+            self.finish()
         finally:
             super().close()
 
@@ -373,11 +420,6 @@ class StreamingVideoRecorder(gym.Wrapper):
             stdin = proc.stdin
             if stdin is not None:
                 stdin.close()
-        for name, proc in self._procs.items():
-            stdout = proc.stdout
-            buf = self._bufs.get(name)
-            if stdout is not None and buf is not None:
-                pass
         # Let the drain threads hit EOF (ffmpeg closes stdout after stdin EOF)
         # and the children exit; then collect what they wrote.
         for name, t in list(self._threads.items()):

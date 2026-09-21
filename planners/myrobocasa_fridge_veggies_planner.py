@@ -1,6 +1,5 @@
 import argparse
 import random
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,16 +10,12 @@ import mplib
 import sapien
 import torch
 from trimesh.primitives import Box
-from transforms3d.euler import euler2quat
-
-from mani_skill.agents.robots import Fetch
 from mani_skill.envs.tasks import MyRoboCasaFridgeVeggies
-from utils.canonical_fetch_solver import FetchMotionPlanningSapienSolver
+from robots.fetch.extand import FetchMotionPlanningSapienSolver
 from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
 from utils.planners_utils import (
     _base_cmd,
     lower_torso_smooth,
-    lower_torso_until_rest,
 )
 
 # lift offsets (world), tried in order: lifting straight up swings the elbow
@@ -230,7 +225,7 @@ def parse_args():
 def _attach_object(planner, obj):
     """Register the grasped object as attached to the gripper in the mplib
     planning world so lift/transport plans stop treating it as an obstacle."""
-    from mani_skill.examples.motionplanning.fetch.utils import attach_object
+    from robots.fetch.utils import attach_object
 
     gripper_link = next(
         l for l in planner.robot._objs[0].get_links() if l.name.endswith("gripper_link")
@@ -445,16 +440,6 @@ def _exclude_target_collision(planner, veg_name):
         acm.set_entry(link.name, veg_name, True)
 
 
-def _restore_target_collision(planner, veg_name):
-    """Undo _exclude_target_collision: make the vegetable a collision obstacle
-    again (called only when ALL grasp attempts failed, so the next stance's
-    drives/reaches still avoid it)."""
-    acm = planner.planner.planning_world.get_allowed_collision_matrix()
-    robot = planner.base_env.agent.robot._objs[0]  # raw sapien articulation
-    for link in robot.get_links():
-        acm.set_entry(link.name, veg_name, False)
-
-
 def _exclude_veggies_collision(env, planner):
     """Allow the robot to collide with ALL the vegetables on the counter (the
     target AND the distractors) in the planning world. The reach's
@@ -542,7 +527,6 @@ def _descend_tcp_step(env, planner, dz, n_init_qpos=200):
     try:
         planner.follow_path(res)
     except AssertionError as e:
-        import numpy as _np
         print("[DESCEND-DEBUG]",
               "arm", agent.controller.controllers["arm"].qpos[0].shape,
               "gs", repr(planner.gripper_state), np.shape(planner.gripper_state),
@@ -828,12 +812,7 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
     vegetable position, not on a calibrated map, so the final centimetres do
     not stall (the P-drive stalled at 0.14-0.20 m; the map-based velocity
     drive diverged after yaw drift). Returns 0 on convergence, -1 otherwise."""
-    from utils.planners_utils import (
-        _screw_base_translate,
-        _rotate_base_to,
-        _velocity_segment,
-    )
-    unwenv = env.unwrapped
+    from utils.planners_utils import _velocity_segment
 
     def heading():
         xa = agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
@@ -868,7 +847,7 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
         d = np.arctan2(rem[1], rem[0])
         # scan the full circle; pick the heading whose drive direction
         # (forward or backward) is closest to the residual
-        h_drive, best_err, h_back = None, np.inf, False
+        h_drive, best_err = None, np.inf
         for h in np.arange(-np.pi, np.pi, np.deg2rad(6.0)):
             # the base-end must stay south of the drive's actual guard
             # (y > -0.95 aborts in _velocity_segment), NOT the conservative
@@ -876,10 +855,10 @@ def _transport_veg(env, planner, agent, target_veg, aim_xy, margin=0.05,
             # -1.0 allows (observed: veg_local 0.44 -> min base-end y -0.993,
             # 7 mm over the line, "no feasible drive heading" -> run lost)
             if base_target(h)[1] <= -0.95:
-                for sign, drive in ((False, h), (True, h + np.pi)):
+                for drive in (h, h + np.pi):
                     err = abs(((drive - d + np.pi) % (2 * np.pi)) - np.pi)
                     if err < best_err:
-                        best_err, h_drive, h_back = err, h, sign
+                        best_err, h_drive = err, h
         if h_drive is None:
             print(f"[INFO] transport: no feasible drive heading at base "
                   f"{np.round(base, 3)}, veg {np.round(veg[:2], 3)} "
@@ -957,7 +936,6 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 local_ext[old_i] > 0.10 and local_ext[new_i] < 0.035
             )
 
-    home_qpos = agent.robot.qpos[0].cpu().numpy().copy()
     arm_idx = agent.controller.controllers["arm"].active_joint_indices.cpu().numpy()
     rest_qpos = np.asarray(agent.keyframes["rest"].qpos)
     # fold ONLY the arm joints: the rest keyframe's base joints are zero, so
@@ -1589,7 +1567,7 @@ if __name__ == "__main__":
         num_envs=1,
         render_mode=None if args.no_video else args.render_mode,
         obs_mode="state" if args.no_video else "rgb",
-        robot_uids="ds_fetch_canonical",
+        robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
         sim_config=dict(scene_config=dict(cpu_workers=1, enable_enhanced_determinism=True)),
     )

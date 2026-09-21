@@ -7,7 +7,7 @@ import torch
 import trimesh
 from mani_skill import ASSET_DIR
 from mani_skill.sensors.camera import CameraConfig
-from mani_skill.utils import common, sapien_utils
+from mani_skill.utils import sapien_utils
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs import Actor, Pose
 from .base_robocasa import BaseRoboCasaSimple
@@ -42,7 +42,6 @@ class MyRoboCasaSceneTakeItBack(BaseRoboCasaSimple):
     # center like the cup's.
     TRAY_BAND_Y = (-0.50, -0.20)
 
-    fxtr_placements: dict[str, dict[str, object]]
     cup_pos: np.ndarray  # [N, 3] initial cup position per env
     camera_pos: np.ndarray
     agent_pose: sapien.Pose

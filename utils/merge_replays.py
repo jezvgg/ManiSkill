@@ -38,7 +38,7 @@ def main():
                     meta = json.loads((src_dir / "trajectory.json").read_text())
                     env_info = meta.get("env_info")
                     commit_info = meta.get("commit_info")
-                src.copy(src[f"traj_0"], dst, name=f"traj_{ep_id}")
+                src.copy(src["traj_0"], dst, name=f"traj_{ep_id}")
             meta = json.loads((src_dir / "trajectory.json").read_text())
             ep = meta["episodes"][0]
             ep["episode_id"] = ep_id

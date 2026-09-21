@@ -1,7 +1,7 @@
 import numpy as np
 import mplib
 
-from utils.canonical_fetch import _base_cmd
+from robots.fetch.actions import base_cmd as _base_cmd
 
 
 def lower_torso_smooth(env, planner, target_drop=0.17, total_steps=100, vis=False, arm_action=None, gripper_action=None):
@@ -50,44 +50,6 @@ def retract_arm_lift_torso(env, planner, lift_amount=0.15, total_steps=40, vis=F
         env.step(action)
         if vis and hasattr(unw_env, "render_human"):
             unw_env.render_human()
-
-    planner.planner.update_from_simulation()
-
-
-def move_base_backward_smooth(env, planner, target_base_pos, max_steps=200, eps=0.015, vis=False):
-    """
-    Smoothly move the base backward toward target_base_pos using simple velocity control.
-    """
-    unwenv = env.unwrapped
-    agent = unwenv.agent
-    arm_action = unwenv.agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-    body_action = unwenv.agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
-    body_action[0] = body_action[1] = 0.0
-    gripper_action = planner.gripper_state
-
-    print(f"[INFO] Smooth base control to target pos: {target_base_pos}")
-    for step in range(max_steps):
-        planner.planner.update_from_simulation()
-        cur_base_p = unwenv.agent.base_link.pose.sp.p.copy()
-        cur_base_dir = agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
-
-        back_delta_world = target_base_pos - cur_base_p
-        back_delta_world[2] = 0.0
-        dist_to_target = np.linalg.norm(back_delta_world)
-
-        if dist_to_target < eps:
-            print(f"[INFO] Reached target base position: {cur_base_p} (dist={dist_to_target:.4f} m, step={step})")
-            break
-
-        rem_dist = float(np.dot(back_delta_world, cur_base_dir))
-        vel = np.clip(rem_dist * 2.5, -0.6, 0.6)
-        base_action = _base_cmd(vel)
-
-        action = np.hstack([arm_action, gripper_action, body_action, base_action])
-        env.step(action)
-
-        if vis and hasattr(unwenv, "render_human"):
-            unwenv.render_human()
 
     planner.planner.update_from_simulation()
 
@@ -231,7 +193,6 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
         waypoint[1] += 0.05
         res = planner.move_base_forward(waypoint, n_init_qpos=100)
         if res == -1:
-            _screw_translate_debug(planner, waypoint)
             print("[INFO] drive_base_to_position: screw segment failed, trying shorter")
             waypoint = base_p + delta * min(1.0, 0.25 / max(dist, 1e-6))
             waypoint[1] += 0.05
@@ -538,122 +499,10 @@ def _drive_base_chunk(planner, target_base_pos, *, speed_scale=0.35):
     return 0
 
 
-def _prop_forward_transport(env, planner, plate_center, *,
-                            stop_dist=0.10, max_cycles=120, fwd_steps=16,
-                            k_gain=1.2, v_max=0.18, align_deg=20.0,
-                            stall_cycles=6):
-    """Polar differential-drive transport for the held vegetable.
-
-    Control law per cycle (all quantities re-MEASURED from the sim):
-      e   = plate_pos - veg_pos          error in the vegetable's position
-      rho = |e|                          remaining distance
-      alpha = wrap(bearing(e) - heading) misalignment of the base heading
-
-      rho > 0.30: if |alpha| large -> gentle yaw toward the bearing;
-                  else slow forward burst (speed ~ min(v_max, rho - 0.25))
-      rho <= 0.30: pure gentle yaw - the vegetable rides an orbit around the
-                  base, so yawing swings it onto the plate without any
-                  translation (the translation primitive is unreliable)
-
-    Slow speeds everywhere: a shallow fingertip pinch holds statically but a
-    fast yaw/translation jolt shakes flat vegetables loose.
-
-    Returns 0 when the vegetable is within stop_dist of the plate center,
-    -1 on stall (no progress over stall_cycles) or vegetable drop.
-    """
-    unwenv = env.unwrapped
-    agent = unwenv.agent
-    arm_action = agent.controller.controllers["arm"].qpos[0].cpu().numpy()
-    body_action = agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
-    body_action[0] = body_action[1] = 0.0
-    gripper_action = planner.gripper_state
-
-    backward = False
-    stall = 0
-    prev_dist = None
-    for _ in range(max_cycles):
-        obj_now = _current_object_pos(env, planner)
-        if obj_now is None:
-            break
-        rem = np.asarray(plate_center, dtype=float) - obj_now
-        rem[2] = 0.0
-        dist = float(np.linalg.norm(rem))
-        if dist <= stop_dist:
-            return 0
-        if obj_now[2] < 0.5:
-            print("[INFO] prop drive: vegetable dropped")
-            return -1
-        # polar control: alpha = bearing error of the base heading relative
-        # to the veg->plate direction
-        evec = np.asarray(plate_center, dtype=float)[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
-        bearing = float(np.arctan2(evec[1], evec[0]))
-        h = float(np.arctan2(
-            agent.base_link.pose.sp.to_transformation_matrix()[1, 0],
-            agent.base_link.pose.sp.to_transformation_matrix()[0, 0]))
-        alpha = (bearing - h + np.pi) % (2 * np.pi) - np.pi
-
-        if dist > 0.30 and abs(alpha) > np.deg2rad(align_deg):
-            # far and misaligned: gentle yaw toward the bearing
-            va = float(np.clip(1.5 * alpha, -0.22, 0.22))
-            env.step(np.hstack([arm_action, gripper_action, body_action,
-                                _base_cmd(yaw=va)]))
-        elif dist > 0.30:
-            # aligned: slow proportional forward burst toward the plate
-            for _ in range(fwd_steps):
-                base = agent.base_link.pose.p[0].cpu().numpy()[:2]
-                to_plate = np.asarray(plate_center, dtype=float)[:2] - base
-                hd = agent.base_link.pose.sp.to_transformation_matrix()[:3, 0][:2]
-                hd = hd / max(float(np.linalg.norm(hd)), 1e-6)
-                fwd_left = float(np.dot(to_plate, hd))
-                vel = float(np.clip(k_gain * fwd_left, -v_max, v_max))
-                if abs(vel) < 0.02:
-                    break
-                env.step(
-                    np.hstack(
-                        [
-                            arm_action,
-                            gripper_action,
-                            body_action,
-                            _base_cmd(-vel if backward else vel),
-                        ]
-                    )
-                )
-        else:
-            # near: pure gentle yaw - the veg rides its orbit onto the plate
-            va = float(np.clip(1.5 * alpha, -0.18, 0.18))
-            env.step(np.hstack([arm_action, gripper_action, body_action,
-                                _base_cmd(yaw=va)]))
-        planner.planner.update_from_simulation()
-
-        obj_now = _current_object_pos(env, planner)
-        if obj_now is None:
-            break
-        dist_now = float(np.linalg.norm(np.asarray(plate_center)[:2] - obj_now[:2]))
-        if dist_now <= stop_dist:
-            return 0
-        progressed = prev_dist is not None and dist_now < prev_dist - 0.005
-        prev_dist = dist_now
-        if progressed:
-            stall = 0
-            continue
-        stall += 1
-        if stall == 1:
-            # flip direction once per stall: some root-z configs only
-            # translate backwards
-            backward = not backward
-        elif stall >= stall_cycles:
-            print(f"[INFO] prop drive: stalled at {dist_now:.2f} m from plate")
-            return -1
-    obj_now = _current_object_pos(env, planner)
-    if obj_now is not None:
-        d = float(np.linalg.norm(np.asarray(plate_center)[:2] - obj_now[:2]))
-        return 0 if d <= stop_dist else -1
-    return -1
 
 
 def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos,
-                                margin=0.04, fixed_arm=False, yaw_sweep=True,
-                                screw=True, vtol=0.12):
+                                margin=0.04, yaw_sweep=True, screw=True, vtol=0.12):
     """Transport a grasped object from current_obj_pos to target_obj_pos.
 
     The carried object is rigid in the base frame, so ANY base rotation sweeps
@@ -677,19 +526,7 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos,
     print(f"[INFO] Transport: base {np.round(base_pos_world, 3)} -> "
           f"{np.round(base_target_pos, 3)} (object move {dist:.3f} m)")
 
-    # 1) fixed-arm transport: closed-loop proportional drive (yaw-align +
-    #    proportional forward bursts). The screw path cannot translate the
-    #    ds_fetch base at all (follow_path sends position targets to a base
-    #    that is velocity-controlled), and the axis-velocity fallback stalls;
-    #    the P-drive with per-cycle yaw re-alignment is the only primitive
-    #    that reliably closes the gap. Falls back to the screw chunks below
-    #    if the P-drive stalls.
-    if fixed_arm:
-        if _prop_forward_transport(env, planner,
-                                   np.asarray(target_obj_pos, dtype=float)) == 0:
-            return
-
-    # 2) rotate in place toward the transfer direction, sweeping the held
+    # 1) rotate in place toward the transfer direction, sweeping the held
     #    object on its orbit: if the sweep carries it over the plate, stop
     #    immediately (the caller lowers and releases without further driving)
     #    yaw_sweep=False skips these rotations; every base rotation swings the
@@ -765,126 +602,3 @@ def drive_base_to_object_target(env, planner, current_obj_pos, target_obj_pos,
                 print("[INFO] Transport: giving up at", base_p)
                 break
         planner.planner.update_from_simulation()
-
-def _screw_translate_debug(planner, waypoint):
-    """DIAGNOSTIC: instrumented copy of SapienPlannerV2.plan_screw for base
-    translation. Runs the same damped-IK screw loop as move_base_forward but
-    reports WHICH termination condition fires (collide / joint_limit /
-    zero_twist) instead of the generic 'screw plan failed'. Plan-only: the
-    planning world is restored afterwards."""
-    pl = planner.planner
-    tcp = planner.base_env.agent.tcp.pose.sp
-    base_link = planner.base_env.agent.base_link.pose.sp
-    delta = np.asarray(waypoint, dtype=float) - base_link.p
-    delta[2] = 0.0
-    target = mplib.Pose(p=tcp.p + delta, q=tcp.q)
-
-    masked_joints = [True, True, True] + [False] + [True] * 11
-
-    pl_robot = pl.robot
-    world = pl.planning_world
-    orig_full = np.array(pl_robot.get_qpos()).reshape(-1).copy()
-    current_qpos = pl.pad_move_group_qpos(orig_full.copy())
-    move_joint_idx = pl.move_group_joint_indices
-    orig_move_qpos = current_qpos[move_joint_idx].copy()
-    def restore():
-        world.set_qpos_all(orig_move_qpos)
-        pl_robot.set_qpos(orig_full, True)
-
-    def skew(vec):
-        return np.array([[0, -vec[2], vec[1]],
-                         [vec[2], 0, -vec[0]],
-                         [-vec[1], vec[0], 0]])
-
-    def rot2so3(R):
-        tr = float(R.trace())
-        if np.isclose(tr, 3.0):
-            return np.zeros(3), 1.0
-        if np.isclose(tr, -1.0):
-            return np.zeros(3), -1e6
-        theta = np.arccos((tr - 1) / 2)
-        return (np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0],
-                          R[1, 0] - R[0, 1]]).T / (2 * np.sin(theta))), theta
-
-    def pose2exp(pose):
-        M = pose.to_transformation_matrix()
-        omega, theta = rot2so3(M[:3, :3])
-        ss = skew(omega)
-        inv_left_jac = (np.eye(3) / theta - 0.5 * ss
-                        + (1.0 / theta - 0.5 / np.tan(theta / 2)) * ss @ ss)
-        v = inv_left_jac @ M[:3, 3]
-        return np.concatenate([v, omega]), theta
-
-    pl_robot.set_qpos(current_qpos, True)
-    pm = pl.pinocchio_model
-    goal = pl._transform_goal_to_wrt_base(target)
-    ee = pl.link_name_2_idx[pl.move_group]
-    pm.compute_forward_kinematics(current_qpos)
-    rel = goal * pm.get_link_pose(ee).inv()
-    omega, theta = pose2exp(rel)
-    if theta < -1e4:
-        print("[DEBUG-screw] FAIL: rotation singularity (pose2exp theta)")
-        restore()
-        return
-    omega = omega.reshape((-1, 1)) * theta
-
-    stats = {"ok_steps": 0, "collide": 0, "joint_limit": 0, "zero_twist": 0}
-    reasons = []
-    while True:
-        pm.compute_full_jacobian(current_qpos)
-        J = pm.get_link_jacobian(ee, local=False)
-        J = J * np.tile(np.asarray(masked_joints), (J.shape[0], 1)).astype(np.int32)
-        delta_q = np.linalg.pinv(J) @ omega
-        n = float(np.linalg.norm(delta_q))
-        if n < 1e-9:
-            reasons.append("pinv_zero_delta")
-            break
-        delta_q *= 0.1 / n
-        delta_twist = J @ delta_q
-        flag = False
-        if np.linalg.norm(delta_twist) > np.linalg.norm(omega):
-            ratio = np.linalg.norm(omega) / np.linalg.norm(delta_twist)
-            delta_q = delta_q * ratio
-            delta_twist = delta_twist * ratio
-            flag = True
-        current_qpos += delta_q.reshape(-1)
-        omega -= delta_twist
-        within = bool(np.all((current_qpos >= pl.joint_limits[:, 0] - 1e-3)
-                             & (current_qpos <= pl.joint_limits[:, 1] + 1e-3)))
-        world.set_qpos_all(current_qpos[move_joint_idx])
-        collide = bool(world.is_state_colliding())
-        pairs = ""
-        if collide:
-            try:
-                res = world.check_robot_collision()
-                names = sorted({f"{r.object_name1}:{r.link_name1} <-> {r.object_name2}:{r.link_name2}"
-                                for r in res})
-                pairs = " PAIRS[" + "; ".join(names[:5]) + "]"
-            except Exception as exc:
-                pairs = f" PAIRS[query failed: {exc}]"
-        if float(np.linalg.norm(delta_twist)) < 1e-4:
-            stats["zero_twist"] += 1
-            reason = "zero_twist"
-        elif collide:
-            stats["collide"] += 1
-            reason = "collide"
-        elif not within:
-            stats["joint_limit"] += 1
-            reason = "joint_limit"
-        else:
-            stats["ok_steps"] += 1
-            if flag:
-                break
-            continue
-        viol = [(i, float(current_qpos[i])) for i in range(len(current_qpos))
-                if current_qpos[i] < pl.joint_limits[i][0] - 1e-3
-                or current_qpos[i] > pl.joint_limits[i][1] + 1e-3]
-        worst = ",".join(f"j{i}={v:.2f}" for i, v in viol[:4]) if viol else ""
-        reasons.append(f"{reason}@step{stats['ok_steps'] + 1}{pairs}"
-                       + (f" viol[{worst}]" if worst else ""))
-        break
-
-    restore()
-    print(f"[DEBUG-screw] stats={stats} | "
-          f"{'; '.join(reasons) if reasons else 'SUCCESS'} | "
-          f"start base qpos xy={np.round(orig_move_qpos[[0, 1]], 3)}")

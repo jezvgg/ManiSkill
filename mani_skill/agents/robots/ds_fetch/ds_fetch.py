@@ -10,7 +10,11 @@ from mani_skill.agents.controllers import *
 from mani_skill.agents.registration import register_agent
 from mani_skill.agents.robots.fetch.fetch import Fetch
 from mani_skill.sensors.camera import CameraConfig
+from mani_skill.utils.scene_builder.robocasa.scene_builder import ROBOT_FRONT_FACING_SIZE
 from mani_skill.utils.structs import Pose
+
+
+ROBOT_FRONT_FACING_SIZE.setdefault("ds_fetch", 0.8)
 
 
 @register_agent()
@@ -18,8 +22,13 @@ class DSFetch(Fetch):
     uid = "ds_fetch"
     # Resolve relative to the repo root so this works from any checkout (local, gangway, worktree).
     urdf_path: str = str(
-        Path(__file__).resolve().parents[4] / "mani_skill/examples/motionplanning/fetch/fetch.urdf"
+        Path(__file__).resolve().parents[4] / "robots/fetch/fetch.urdf"
     )
+
+    def before_simulation_step(self):
+        super().before_simulation_step()
+        if self.scene.gpu_sim_enabled:
+            self.scene.px.gpu_apply_articulation_target_position()
 
     @property
     def _sensor_configs(self):
@@ -298,6 +307,27 @@ class DSFetch(Fetch):
                 base=base_pd_joint_vel,
             ),
         )
+
+        # The project action contract is [arm, gripper, body, forward, yaw].
+        # Keep the Fetch base controller's first and last limits, dropping lateral vy.
+        for config in controller_configs.values():
+            old = config["base"]
+            config["base"] = PDBaseForwardVelControllerConfig(
+                self.base_joint_names,
+                lower=[old.lower[0], old.lower[-1]],
+                upper=[old.upper[0], old.upper[-1]],
+                damping=old.damping,
+                force_limit=old.force_limit,
+                friction=old.friction,
+                normalize_action=old.normalize_action,
+                drive_mode=old.drive_mode,
+            )
+        for mode in (
+            "pd_joint_delta_pos",
+            "pd_joint_target_delta_pos",
+            "pd_joint_delta_pos_stiff_body",
+        ):
+            controller_configs[mode]["arm"].normalize_action = False
 
         # Make a deepcopy in case users modify any config
         return deepcopy_dict(controller_configs)

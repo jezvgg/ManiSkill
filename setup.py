@@ -21,10 +21,6 @@ def get_nightly_version():
     return f"{today.year}.{today.month}.{today.day}.{timing}"
 
 
-def get_python_version():
-    return f"cp{sys.version_info.major}{sys.version_info.minor}"
-
-
 def get_dependencies():
     install_requires = [
         "numpy>=1.22",
@@ -92,7 +88,7 @@ def main(argv):
         long_description_content_type="text/markdown",
         author="ManiSkill contributors",
         url="https://github.com/haosulab/ManiSkill",
-        packages=find_packages(include=["mani_skill*", "my_scenes*"]),
+        packages=find_packages(include=["mani_skill*", "my_scenes*", "robots*"]),
         python_requires=">=3.9",
         setup_requires=["setuptools>=62.3.0"],
         install_requires=get_dependencies(),
@@ -100,6 +96,7 @@ def main(argv):
         package_data={
             "mani_skill": ["assets/**", "envs/**/*", "utils/**/*"],
             "my_scenes": ["*"],
+            "robots.fetch": ["fetch.urdf", "fetch.srdf", "fetch_description/**/*"],
             "warp_maniskill.warp": ["native/*", "native/nanovdb/*"],
         },
         extras_require={
@@ -111,7 +108,6 @@ def main(argv):
                 "build",
                 "twine",
                 "stable_baselines3",
-                "nvidia-ml-py",
                 "pytest-xdist[psutil]",
                 "pytest-forked",
             ],
