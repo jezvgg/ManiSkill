@@ -120,8 +120,12 @@ class MyRoboCasaFridgePicture(BaseRoboCasaSimple):
 
     @property
     def _default_human_render_camera_configs(self):
-        camera_pos = self.robot_spawn_pos + np.array([0.0, 0.0, 1.3])
-        pose = sapien_utils.look_at(camera_pos, self.picture_center)
+        # DIAGNOSTIC VIEW: look at the counter (pot + vegetables + robot)
+        # instead of the fridge picture - the fridge view hid the whole
+        # manipulation area in the recordings
+        camera_pos = self.counter_pos + np.array([0.0, -1.2, 2.4])
+        target = self.counter_pos + np.array([0.0, 0.0, 0.5])
+        pose = sapien_utils.look_at(camera_pos, target)
         return CameraConfig(
             "render_camera", pose, 2048, 2048, 60 * np.pi / 180, 0.01, 100
         )

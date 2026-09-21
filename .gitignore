@@ -47,5 +47,8 @@ htmlcov/
 
 .codex
 
+# pi agent local config (skill wiring, settings, trust)
+.pi
+
 docs/superpowers
 logs

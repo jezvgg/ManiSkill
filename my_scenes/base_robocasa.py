@@ -4,10 +4,10 @@ import torch
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils.scene_builder.robocasa.scene_builder import RoboCasaSceneBuilder
 from mani_skill.utils.structs import Pose
-from utils.scene_utils import degree_to_quanterion
+from utils.scene_utils import degree_to_quanterion, subtract_rect
 
 class BaseRoboCasaScene(BaseEnv):
-    SUPPORTED_ROBOTS = ["fetch", "none"]
+    SUPPORTED_ROBOTS = ["fetch", "ds_fetch", "none"]
     SUPPORTED_REWARD_MODES = ["none"]
     FIXTURE_SEED: int = None
 
@@ -16,7 +16,7 @@ class BaseRoboCasaScene(BaseEnv):
     counter_size: np.ndarray
     cup_pos: np.ndarray
 
-    def __init__(self, robot_uids="fetch", *args, **kwargs):
+    def __init__(self, robot_uids="ds_fetch", *args, **kwargs):
         super().__init__(robot_uids=robot_uids, *args, **kwargs)
         self.fixture_placements = {}
 
@@ -69,7 +69,7 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
     detected generically from fixture_placements: any fixture whose vertical
     span reaches the counter top plane and whose footprint overlaps the counter
     is subtracted. Results: self.usable_regions (N, 4) rects [x0, x1, y0, y1]
-    at counter top height, self.usable_area (m^2), self.blockers.
+    at counter top height and self.usable_area (m^2).
 
     Free placement: the robot is spawned at a random free floor spot, computed
     once at load time as the floor area minus every fixture/object footprint
@@ -94,7 +94,6 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
     cup_pos: np.ndarray
     usable_regions: np.ndarray
     usable_area: float
-    blockers: list[np.ndarray]
     free_cells: np.ndarray  # [N, 2] candidate robot (x, y) positions on the floor
     floor_bounds: np.ndarray  # [x0, x1, y0, y1] of the floor in world coords
     agent_pose: sapien.Pose
@@ -103,7 +102,6 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
         super()._load_scene(options)
         # NOTE: fixture_placements is cleared after __init__ (see BaseRoboCasaScene),
         # so everything derived from it must be captured here.
-        self.blockers = self._counter_blockers()
         self.usable_regions = self._compute_usable_regions()
         self.usable_area = float(
             sum((r[1] - r[0]) * (r[3] - r[2]) for r in self.usable_regions)
@@ -119,9 +117,37 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
         agent_pos = self.agent.robot.pose.p[0]
         agent_pos[0] = pos[0]
         agent_pos[1] = pos[1]
-        q = degree_to_quanterion(z=int(self._main_rng.uniform(0, 360)))
+        q = degree_to_quanterion(z=int(self._sample_spawn_yaw(pos)))
         self.agent_pose = Pose.create_from_pq(p=agent_pos, q=q)
         self.agent.robot.set_pose(self.agent_pose)
+
+    def _sample_spawn_yaw(self, pos):
+        """Sample a spawn yaw so the straight arm's gripper (1.13 m forward)
+        spawns over the OPEN FLOOR, south of the counter - a random yaw can
+        aim the arm over the counter and the gripper spawns INSIDE the
+        fixtures (a stuck initial pose; verified: seeds 9/17 - the gripper
+        against the oven door / over the stove, failing every drive)."""
+        x0, y0 = pos
+        r = 1.13
+        fb = self.floor_bounds
+        front = self.counter_pos[1] - self.counter_size[1] / 2 - 0.10
+        cand = np.arange(0, 360, 2)
+        tx = x0 + r * np.cos(np.deg2rad(cand))
+        ty = y0 + r * np.sin(np.deg2rad(cand))
+        ok = (
+            (tx >= fb[0] + 0.10) & (tx <= fb[1] - 0.10)
+            & (ty >= fb[2] + 0.10) & (ty <= front - 0.05)
+        )
+        feasible = cand[ok]
+        # draw the SAME uniform(0,360) the old code did FIRST - this keeps
+        # the RNG stream (and every seed's object layout) identical to the
+        # pre-fix runs; the draw is then remapped into the feasible arc
+        # deterministically
+        u = float(self._main_rng.uniform(0, 360))
+        if len(feasible):
+            idx = min(int((u / 360.0) * len(feasible)), len(feasible) - 1)
+            return int(feasible[idx])
+        return int(u)
 
     # ------------------------------------------------------------------ #
     # Usable area on the main counter
@@ -140,7 +166,7 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
         for b in self._counter_blockers():
             gap = self.BLOCKER_GAP
             blocker = np.array([b[0] - gap, b[1] + gap, b[2] - gap, b[3] + gap])
-            regions = self._subtract_rects(regions, blocker)
+            regions = subtract_rect(regions, blocker)
         return np.asarray(regions)
 
     def _counter_blockers(self) -> list[np.ndarray]:
@@ -173,41 +199,6 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
             if ox1 - ox0 > self.MIN_OVERLAP and oy1 - oy0 > self.MIN_OVERLAP:
                 blockers.append(np.array([ox0, ox1, oy0, oy1]))
         return blockers
-
-    @staticmethod
-    def _subtract_rects(regions, blocker):
-        """Subtract blocker [x0, x1, y0, y1] from a list of rects (axis-aligned)."""
-        out = []
-        bx0, bx1, by0, by1 = blocker
-        for r in regions:
-            x0, x1, y0, y1 = r
-            ix0, ix1 = max(x0, bx0), min(x1, bx1)
-            iy0, iy1 = max(y0, by0), min(y1, by1)
-            if ix0 >= ix1 or iy0 >= iy1:
-                out.append(r)
-                continue
-            if x0 < ix0:
-                out.append([x0, ix0, y0, y1])
-            if ix1 < x1:
-                out.append([ix1, x1, y0, y1])
-            if y0 < iy0:
-                out.append([ix0, ix1, y0, iy0])
-            if iy1 < y1:
-                out.append([ix0, ix1, iy1, y1])
-        return out
-
-    def sample_placement_pos(self, rng: np.random.RandomState = None) -> np.ndarray:
-        """Sample a random [x, y, z] inside the usable area (z = counter top surface)."""
-        if len(self.usable_regions) == 0:
-            raise RuntimeError("No usable area on the main counter")
-        if rng is None:
-            rng = np.random.default_rng()
-        areas = np.array(
-            [(r[1] - r[0]) * (r[3] - r[2]) for r in self.usable_regions]
-        )
-        r = self.usable_regions[rng.choice(len(areas), p=areas / areas.sum())]
-        z = self.counter_pos[2] + self.counter_size[2] / 2
-        return np.array([rng.uniform(r[0], r[1]), rng.uniform(r[2], r[3]), z])
 
     # ------------------------------------------------------------------ #
     # Free robot placement on the floor

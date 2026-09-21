@@ -4,7 +4,7 @@
 
 This repository is a **fork of ManiSkill 3** repurposed as a **VLA (Vision-Language-Action) memory benchmark** for household robotic tasks. The benchmark tests whether VLA models can remember and execute multi-step manipulation sequences in kitchen environments (RoboCasa scenes). The upstream ManiSkill engine (SAPIEN 3.0+ / NVIDIA PhysX CUDA) is used as-is for GPU-parallelized simulation and Vulkan rendering.
 
-> **Edit boundary**: All development happens exclusively in `my_scenes/` (benchmark scene definitions), `planners/` (motion-planning solvers), and `utils/` (shared utility helpers). **NEVER modify files outside these three directories.** Everything else is upstream ManiSkill infrastructure and must remain untouched.
+> **Edit boundary**: Project development happens in `my_scenes/` (benchmark scenes), `planners/` (task planners), `utils/` (shared utilities), and `robots/fetch/` (the project-owned Fetch stack). The single integration point `mani_skill/agents/robots/ds_fetch/ds_fetch.py` is also project-owned: it registers the one canonical `ds_fetch` agent and points to `robots/fetch`. Do not add Fetch planning code back under `mani_skill/examples/`; that directory was removed intentionally. Other ManiSkill infrastructure remains upstream/read-only.
 
 ---
 
@@ -76,10 +76,15 @@ This repository is a **fork of ManiSkill 3** repurposed as a **VLA (Vision-Langu
 - `my_scenes/`: **Benchmark scene definitions.** Custom `BaseEnv` subclasses registered as Gymnasium environments for the VLA memory benchmark. Each file defines a RoboCasa-based kitchen task with object placement, evaluation logic, reward shaping, and camera configs.
   - `my_robocasa.py` — `MyRoboCasaScene` (`MyRoboCasa-v1`): base kitchen scene with a Fetch robot, bowl + cup on a counter, and a dense reward for grasping/placing.
   - `my_robocasa_takeitback.py` — `MyRoboCasaSceneTakeItBack` (`MyRoboCasa_TakeItBack-v1`): extended task requiring the robot to move a cup from counter to sink and back, testing spatial memory.
-  - `__init__.py` — re-exports both scene classes and helpers (`get_actor_size`, `degree_to_quanterion`).
+  - `water_plants.py` — `WaterPlantsTask` (`MikasaWaterPlants-v0`): remembers which plants were watered while making refill trips.
+  - `depth_recall_v1.py` — `DepthRecallV1Task` (`MikasaDepthRecall-v1`): remembers cabinet-row positions while restoring props.
+  - `__init__.py` — imports all registered scene classes and shared helpers.
 - `planners/`: **Motion-planning solvers** that drive the benchmark scenes end-to-end using `FetchMotionPlanningSapienSolver` (mplib). Each planner orchestrates grasp planning, IK, path execution, and gripper control for its corresponding scene. Runnable as standalone scripts (`python planners/<file>.py`).
   - `myrobocasa_planner.py` — solver for `MyRoboCasa-v1`.
   - `myrobocasa_takeitback_planner.py` — solver for `MyRoboCasa_TakeItBack-v1` (includes smooth base movement for multi-waypoint tasks).
+  - `water_plants_planner.py` — solver for `MikasaWaterPlants-v0`.
+  - `depth_recall_v1_planner.py` — solver for `MikasaDepthRecall-v1`.
+- `robots/fetch/`: **Project-owned Fetch stack.** Contains the canonical 13D action contract, Fetch motion solver, mplib planning-world adapter, root-frame/yaw/step helpers, and Fetch URDF/SRDF data.
 - `utils/`: **Shared utility helpers.** Custom helper libraries for common tasks.
   - `planners_utils.py` — Contains shared parameters and functions for motion planners (e.g. torso lowering, safe base backing, screw/planar alignment).
   - **Development Guideline**: When creating a new motion planner, agents MUST inspect `utils/planners_utils.py` and existing planners in `planners/` to reuse these custom helper functions rather than duplicating operations or rewriting simulation loops by hand.

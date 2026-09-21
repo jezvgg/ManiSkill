@@ -8,7 +8,7 @@ from mani_skill.utils import sapien_utils
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs import Actor, Pose
 from .base_robocasa import BaseRoboCasaScene
-from utils.scene_utils import get_actor_size, degree_to_quanterion
+from utils.scene_utils import get_actor_size
 
 @register_env("MyRoboCasa-v1", asset_download_ids=["RoboCasa"])
 class MyRoboCasaScene(BaseRoboCasaScene):
